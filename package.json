@@ -1,6 +1,7 @@
 {
-  "name": "budget-summary",
+  "name": "epic-capstone-close",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -10,9 +11,7 @@
     "vite": "^6.3.5"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.104.1",
-    "@supabase/supabase-js": "^2.108.2",
-    "jspdf": "^4.2.1",
+    "@supabase/supabase-js": "^2.45.0",
     "xlsx": "^0.18.5"
   }
 }

@@ -4,9 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Context
 
-This is the **EPiC Capstone** project for Pioneer Management Consulting — a financial data analysis tool. The primary data source (`financial-data.csv`) contains monthly P&L actuals, budget, and prior-year comparisons across revenue, COGS, and operating expense line items for consulting engagements.
+This is the **EPiC Capstone** project for Pioneer Management Consulting — a month-end **close reconciliation** tool. A single web app walks three roles through one workflow, with all state persisted in Supabase:
 
-Reference documents in `information/` provide context on closed projects and revenue breakdowns by client and project.
+1. **Consultant** uploads the firm P&L and the revenue-by-client/project export. Claude reconciles total project revenue against the P&L "Revenue" line for each month and flags discrepancies.
+2. **Financial analyst** (client side) reviews Claude's reconciliation and confirms each month.
+3. **CFO** approves or denies each confirmed month.
+
+Status machine on `reconciliations`: `pending_analyst → pending_cfo → approved | denied`. A denied month returns to the analyst to re-submit.
+
+Sample data lives in `sample-data/` (`financial-data.csv`, `revenue-by-client.csv`).
 
 ## Commands
 
@@ -16,20 +22,30 @@ npm run build     # Production build → dist/
 npm run preview   # Preview production build locally
 ```
 
-Python scripts (if any): activate `.venv/` first — `.venv\Scripts\activate` on Windows.
-
 ## Architecture
 
-This is a **Vite + vanilla JS** frontend app (no framework). Key dependencies:
+**Vite + vanilla JS**, single-page, no framework. Entry: `index.html` → `main.js`.
 
-- `@anthropic-ai/sdk` — Claude API integration for AI-powered financial analysis
-- `xlsx` — parsing `financial-data.csv` and Excel files client-side
+- `main.js` — role switcher + the three role views, wired to Supabase.
+- `src/reconcile.js` — file parsing (CSV/XLSX), per-month P&L-vs-projects reconciliation, and discrepancy commentary via the Edge Function (with a local fallback when it's unreachable or has no key).
+- `src/supabase.js` — Supabase client (publishable key, no auth session).
+- `supabase/functions/analyze-reconciliation/` — Deno Edge Function that proxies the Anthropic API so the key never reaches the browser.
 
-The app reads financial CSV/spreadsheet data in the browser, sends it to Claude via the Anthropic SDK, and renders analysis results. Entry points follow standard Vite convention (`index.html` → `main.js`).
+Dependencies: `@supabase/supabase-js` (persistence + Edge Function invocation), `xlsx` (spreadsheet parsing). The Anthropic call lives in the Edge Function, not the client bundle.
+
+Roles are selected with a **client-side switcher** (prototype — no login). The Supabase project keeps three seeded `user_roles`/auth users from an earlier auth-based design; the switcher does not depend on them.
 
 ## Environment
 
-API keys go in `.env` (gitignored). The Anthropic API key must be present for Claude features to work. Vite exposes env vars prefixed with `VITE_` to the client bundle.
+Env vars go in `.env` (gitignored), exposed to the client via Vite's `VITE_` prefix:
+
+- `VITE_SUPABASE_URL`, `VITE_SUPABASE_KEY` — the Capstone Supabase project + publishable key (publishable keys are safe in the client bundle).
+
+The Anthropic key is **not** a client var. It is set as the `ANTHROPIC_API_KEY` secret on the `analyze-reconciliation` Edge Function (`supabase secrets set ANTHROPIC_API_KEY=…`, or the dashboard under Edge Functions → Secrets). Without it the function returns no commentary and the client renders a local fallback.
+
+## Database
+
+Supabase project **Capstone** (`tvhmtjxzrlmynmjhkkse`). Core table `reconciliations` (one row per month/year, unique on `(month, year)`). Prototype RLS grants the `anon` role select/insert/update so the role switcher works without auth. Schema changes are tracked as Supabase migrations.
 
 ## Infrastructure
 
@@ -37,4 +53,4 @@ All backend infrastructure must use Pioneer Management Consulting's official **S
 
 ## Data
 
-`financial-data.csv` (untracked) contains the core financial dataset. Treat it as sensitive — do not commit it or expose its contents in logs or outputs.
+`sample-data/financial-data.csv` is the core financial dataset (firm P&L). Treat financial data as sensitive — do not expose its contents in logs or outputs.
