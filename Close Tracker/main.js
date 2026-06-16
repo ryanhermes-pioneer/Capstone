@@ -1,4 +1,5 @@
 import { supabase } from './src/supabase.js';
+import { downloadInvoicePDF } from './src/invoice.js';
 import {
   MONTH_ORDER, THRESHOLD,
   fileToRows,
@@ -62,6 +63,21 @@ function getSelectedMonths() {
   return [];
 }
 
+// ── Realtime ─────────────────────────────────────────────────────
+let realtimeChannel = null;
+
+function initRealtime() {
+  if (realtimeChannel) supabase.removeChannel(realtimeChannel);
+  realtimeChannel = supabase.channel('app-changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'reconciliations' }, () => {
+      fetchRecs().then(updateProgress);
+    })
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'audit_log' }, () => {
+      updateAuditTrail();
+    })
+    .subscribe();
+}
+
 // ── Auth ─────────────────────────────────────────────────────────
 async function init() {
   const { data: { session } } = await supabase.auth.getSession();
@@ -71,6 +87,7 @@ async function init() {
   supabase.auth.onAuthStateChange(async (event, session) => {
     if (event === 'SIGNED_IN' && session) await onSignIn(session.user);
     else if (event === 'SIGNED_OUT') {
+      if (realtimeChannel) { supabase.removeChannel(realtimeChannel); realtimeChannel = null; }
       currentUser = null; currentRole = null;
       setHeader(false); renderLanding();
     }
@@ -87,17 +104,40 @@ async function onSignIn(user) {
   }
   currentRole = data.role;
   setHeader(true, user.email, currentRole);
+  fetchRecs().then(updateProgress);
+  initRealtime();
   renderForRole();
 }
 
 function setHeader(loggedIn, email = '', role = '') {
+  const track = document.getElementById('progressTrack');
   if (loggedIn) {
     userRoleEl.textContent   = ROLE_LABEL[role] || role;
     userEmailEl.textContent  = email;
     userInfoEl.style.display = 'flex';
+    if (track) track.style.display = 'flex';
   } else {
     userInfoEl.style.display = 'none';
+    if (track) track.style.display = 'none';
   }
+}
+
+function updateProgress(recs) {
+  const hasData      = recs.length > 0;
+  const hasSubmitted = recs.some(r => ['pending_cfo','approved'].includes(r.status));
+  const allApproved  = hasData && recs.every(r => r.status === 'approved');
+  const states       = [hasData, hasSubmitted, allApproved];
+
+  states.forEach((done, i) => {
+    const el = document.getElementById(`pStep${i + 1}`);
+    if (!el) return;
+    const isActive = !done && (i === 0 || states[i - 1]);
+    el.className = `progress-step${done ? ' done' : isActive ? ' active' : ''}`;
+  });
+  states.slice(0, -1).forEach((done, i) => {
+    const conn = document.getElementById(`pConn${i + 1}`);
+    if (conn) conn.className = `progress-conn${done ? ' done' : ''}`;
+  });
 }
 
 document.getElementById('homeBadge').addEventListener('click',  async () => supabase.auth.signOut());
@@ -118,7 +158,7 @@ function renderLanding() {
       <div class="landing-card">
         <div class="landing-logo">
           <div class="p-badge-lg">P</div>
-          <h1 class="landing-title">Close <em>Reconciliation</em></h1>
+          <h1 class="landing-title">Claude <em>Close</em></h1>
           <p class="landing-sub">EPiC 2026 &middot; Pioneer Management Consulting</p>
         </div>
         <form class="login-form" id="loginForm" novalidate>
@@ -170,6 +210,7 @@ async function upsertRec(rec) {
     updated_at: new Date().toISOString(),
   }, { onConflict: 'month,year' });
   if (error) { toast(error.message, 'err'); return false; }
+  await insertAuditLog('Submitted to CFO', rec.month, rec.year);
   return true;
 }
 
@@ -180,6 +221,42 @@ async function updateStatus(id, patch) {
     .eq('id', id);
   if (error) { toast(error.message, 'err'); return false; }
   return true;
+}
+
+async function insertAuditLog(action, month, year, details = null) {
+  await supabase.from('audit_log').insert({
+    action, month, year: year || 2026,
+    user_email: currentUser?.email ?? null,
+    details,
+  });
+}
+
+async function fetchAuditLog() {
+  const { data } = await supabase
+    .from('audit_log').select('*')
+    .order('created_at', { ascending: false }).limit(50);
+  return data || [];
+}
+
+const AUDIT_ACTION_CLS = { 'Submitted to CFO': 'st-amber', 'Approved': 'st-green', 'Denied': 'st-red' };
+
+function auditLogRows(log) {
+  if (!log.length) return '<tr><td colspan="5" class="muted" style="text-align:center;padding:1rem;">No activity yet.</td></tr>';
+  return log.map(e => `
+    <tr>
+      <td>${new Date(e.created_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</td>
+      <td><span class="st ${AUDIT_ACTION_CLS[e.action]||''}">${esc(e.action)}</span></td>
+      <td>${esc(e.month||'—')} ${e.year||''}</td>
+      <td class="muted">${esc(e.user_email||'—')}</td>
+      <td class="muted">${esc(e.details||'')}</td>
+    </tr>`).join('');
+}
+
+async function updateAuditTrail() {
+  const tbody = document.querySelector('.audit-card tbody');
+  if (!tbody) return;
+  const log = await fetchAuditLog();
+  tbody.innerHTML = auditLogRows(log);
 }
 
 // ── CSV download ─────────────────────────────────────────────────
@@ -271,7 +348,7 @@ function renderInvoiceSelectors() {
         <select class="sel" id="selMo"${!months.length ? ' disabled' : ''}>${moOpts}</select>
       </div>
     </div>
-    <div id="invoiceCard">${consultant.selectedMonth ? buildInvoiceHTML() : ''}</div>`;
+    <div id="invoiceCard"></div>`;
 
   document.getElementById('selCo').addEventListener('change', e => {
     consultant.selectedCompany = e.target.value; consultant.selectedMonth = null;
@@ -279,28 +356,34 @@ function renderInvoiceSelectors() {
   });
   document.getElementById('selMo').addEventListener('change', e => {
     consultant.selectedMonth = e.target.value;
-    const card = document.getElementById('invoiceCard');
-    if (card) card.innerHTML = buildInvoiceHTML();
+    renderInvoiceCard();
   });
+
+  if (consultant.selectedMonth) renderInvoiceCard();
 }
 
-function buildInvoiceHTML() {
+function renderInvoiceCard() {
   const { selectedCompany: co, selectedMonth: mo, projRows } = consultant;
-  if (!co || !mo) return '';
+  const card = document.getElementById('invoiceCard');
+  if (!card || !co || !mo) return;
+
   const projects = extractProjectsForCompany(projRows, co, mo);
-  if (!projects.length) return '<p class="hint">No projects found for this selection.</p>';
-  const total       = projects.reduce((s,p) => s + p.revenue, 0);
+  if (!projects.length) {
+    card.innerHTML = '<p class="hint">No projects found for this selection.</p>';
+    return;
+  }
+
+  const total       = projects.reduce((s, p) => s + p.revenue, 0);
   const projectRows = projects.map(p => `<tr><td>${esc(p.project)}</td><td class="num">${money(p.revenue)}</td></tr>`).join('');
-  const bodyLines   = ['Pioneer Management Consulting',`Invoice: ${co}`,`Period: ${mo} 2026`,'',
-    ...projects.map(p=>`${p.project}: ${money(p.revenue)}`),'',`Total: ${money(total)}`,'',
-    'Generated by EPiC Close Reconciliation'].join('\n');
-  const subject = encodeURIComponent(`Invoice: ${co} — ${mo} 2026`);
-  const body    = encodeURIComponent(bodyLines);
-  return `
+
+  card.innerHTML = `
     <div class="invoice-card">
       <div class="invoice-hdr">
         <div><div class="invoice-title">${esc(co)}</div><div class="invoice-period">${esc(mo)} 2026</div></div>
-        <a class="btn btn-primary" href="mailto:?subject=${subject}&body=${body}">Send Invoice</a>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="btn" id="btnDownloadPDF">Download PDF</button>
+          <button class="btn btn-primary" id="btnSendInvoice">Send Invoice</button>
+        </div>
       </div>
       <div class="tscroll">
         <table class="ledger">
@@ -310,6 +393,17 @@ function buildInvoiceHTML() {
         </table>
       </div>
     </div>`;
+
+  document.getElementById('btnDownloadPDF').addEventListener('click', () => {
+    downloadInvoicePDF(co, mo, projects);
+  });
+
+  document.getElementById('btnSendInvoice').addEventListener('click', () => {
+    downloadInvoicePDF(co, mo, projects);
+    const subject = encodeURIComponent(`Invoice: ${co} — ${mo} 2026`);
+    const body    = encodeURIComponent(`Please find the invoice for ${co}, ${mo} 2026 attached.\n\nThe PDF has been saved to your downloads — please attach it before sending.\n\nGenerated by Claude Close.`);
+    window.location.href = `mailto:?subject=${subject}&body=${body}`;
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -422,6 +516,7 @@ async function renderPeriodAnalysis() {
   }));
 
   const existing = await fetchRecs();
+  updateProgress(existing);
   const byMonth  = Object.fromEntries(existing.map(r => [r.month, r]));
   const merged   = recs.map(r => ({
     ...r,
@@ -546,9 +641,12 @@ async function loadAnalystFile(file, key) {
 // ══════════════════════════════════════════════════════════════════
 
 async function renderCFO() {
-  const allRecs      = await fetchRecs();
-  const pendingRecs  = allRecs.filter(r => r.status === 'pending_cfo');
-  const approvedRecs = sortByMonth(allRecs.filter(r => r.status === 'approved'));
+  const [allRecs, log] = await Promise.all([fetchRecs(), fetchAuditLog()]);
+  updateProgress(allRecs);
+  const pendingRecs    = allRecs.filter(r => r.status === 'pending_cfo');
+  const approvedRecs   = sortByMonth(allRecs.filter(r => r.status === 'approved'));
+
+  const logRows = auditLogRows(log);
 
   view.innerHTML = `
     <section class="card">
@@ -565,6 +663,15 @@ async function renderCFO() {
             Download approved (${approvedRecs.length} month${approvedRecs.length!==1?'s':''})
           </button>` : ''}
       </div>
+    </section>
+    <section class="card audit-card">
+      <h2 class="audit-hdr">Audit trail</h2>
+      <div class="tscroll">
+        <table class="ledger">
+          <thead><tr><th>Time</th><th>Action</th><th>Month</th><th>By</th><th>Notes</th></tr></thead>
+          <tbody>${logRows}</tbody>
+        </table>
+      </div>
     </section>`;
 
   wireCFOActions(pendingRecs, approvedRecs);
@@ -580,20 +687,23 @@ function wireCFOActions(pendingRecs, approvedRecs) {
         status:'denied', cfo_user_id: currentUser?.id ?? null,
         cfo_decided_at: new Date().toISOString(), denial_note: note,
       });
-      if (ok) { toast('Denied.', 'err'); renderCFO(); }
-      else btn.disabled = false;
+      if (ok) {
+        await insertAuditLog('Denied', btn.dataset.month, parseInt(btn.dataset.year), note || null);
+        toast('Denied.', 'err'); renderCFO();
+      } else btn.disabled = false;
     });
   });
 
   document.getElementById('btnApproveAll')?.addEventListener('click', async () => {
     const btn = document.getElementById('btnApproveAll');
     btn.disabled = true; btn.textContent = 'Approving…';
-    await Promise.all(pendingRecs.map(r =>
+    await Promise.all(pendingRecs.map(r => Promise.all([
       updateStatus(r.id, {
         status:'approved', cfo_user_id: currentUser?.id ?? null,
         cfo_decided_at: new Date().toISOString(),
-      })
-    ));
+      }),
+      insertAuditLog('Approved', r.month, r.year),
+    ])));
     toast(`${pendingRecs.length} month${pendingRecs.length!==1?'s':''} approved.`);
     renderCFO();
   });
@@ -611,7 +721,7 @@ function cfoTable(recs) {
     const st  = STATUS[r.status];
     const badge  = st ? `<span class="st ${st.cls}">${st.label}</span>` : '—';
     const action = r.status === 'pending_cfo'
-      ? `<button class="btn btn-sm btn-deny" data-act="deny" data-id="${r.id}">Deny</button>`
+      ? `<button class="btn btn-sm btn-deny" data-act="deny" data-id="${r.id}" data-month="${esc(r.month)}" data-year="${r.year||2026}">Deny</button>`
       : '<span class="muted">—</span>';
     return `
       <tr>

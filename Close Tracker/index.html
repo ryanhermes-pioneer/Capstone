@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Close Reconciliation · EPiC 2026</title>
+  <title>Claude Close · EPiC 2026</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
 
 <header>
   <div class="p-badge" id="homeBadge">P</div>
-  <span class="brand-name">Close <em>Reconciliation</em></span>
+  <span class="brand-name">Claude <em>Close</em></span>
 <div class="hdr-spacer"></div>
   <div class="user-info" id="userInfo">
     <span class="user-role" id="userRoleBadge"></span>
@@ -18,6 +18,14 @@
     <button class="btn-signout" id="btnSignOut">Sign out</button>
   </div>
 </header>
+
+<div class="progress-track" id="progressTrack">
+  <div class="progress-step" id="pStep1"><div class="step-dot"></div><span>Upload Data</span></div>
+  <div class="progress-conn" id="pConn1"></div>
+  <div class="progress-step" id="pStep2"><div class="step-dot"></div><span>Analyst Review</span></div>
+  <div class="progress-conn" id="pConn2"></div>
+  <div class="progress-step" id="pStep3"><div class="step-dot"></div><span>CFO Approval</span></div>
+</div>
 
 <main class="main" id="view"></main>
 

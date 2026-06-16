@@ -203,6 +203,42 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
 }
 .sel:focus { outline: none; border-color: var(--green); }
 
+/* ── Progress bar ── */
+.progress-track {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+  padding: 0.85rem 2rem;
+}
+.progress-step {
+  display: flex; flex-direction: column; align-items: center; gap: 0.3rem;
+  min-width: 110px;
+}
+.progress-step span { font-size: 0.72rem; color: var(--gray4); white-space: nowrap; }
+.step-dot {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 2px solid var(--line); background: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.72rem; font-weight: 700; color: transparent;
+  transition: all 0.2s;
+}
+.progress-conn {
+  flex: 1; height: 2px; background: var(--line);
+  margin-bottom: 18px; transition: background 0.2s;
+}
+.progress-step.done .step-dot  { background: var(--green); border-color: var(--green); color: #fff; }
+.progress-step.done .step-dot::after { content: '✓'; }
+.progress-step.done span       { color: var(--green); font-weight: 600; }
+.progress-step.active .step-dot { border-color: var(--green); box-shadow: 0 0 0 3px rgba(87,161,119,0.18); }
+.progress-step.active span      { color: var(--dark); font-weight: 600; }
+.progress-conn.done { background: var(--green); }
+
+/* ── Audit trail ── */
+.audit-card { margin-top: 0; }
+.audit-hdr { font-size: 0.85rem; font-weight: 600; color: var(--gray4); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.75rem; }
+
 /* ── Invoice card ── */
 .invoice-card { margin-top: 1.5rem; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .invoice-hdr {
