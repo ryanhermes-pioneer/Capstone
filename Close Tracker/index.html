@@ -3,102 +3,26 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Invoice Generator · EPiC 2026</title>
-  <link rel="stylesheet" href="styles.css">
+  <title>Close Reconciliation · EPiC 2026</title>
+  <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
 
 <header>
-  <div class="p-badge">P</div>
-  <span class="brand-name">Invoice <em>Generator</em></span>
-  <span class="brand-sub">EPiC 2026</span>
-  <div class="hdr-spacer"></div>
-  <div class="status-pill" id="sPill" data-s="idle">
-    <span class="status-dot"></span>
-    <span id="sTxt">No data loaded</span>
+  <div class="p-badge" id="homeBadge">P</div>
+  <span class="brand-name">Close <em>Reconciliation</em></span>
+<div class="hdr-spacer"></div>
+  <div class="user-info" id="userInfo">
+    <span class="user-role" id="userRoleBadge"></span>
+    <span class="user-email" id="userEmail"></span>
+    <button class="btn-signout" id="btnSignOut">Sign out</button>
   </div>
 </header>
 
-<div class="page">
-  <aside class="sidebar">
-    <div class="panel">
-      <div class="panel-hdr">Generate Invoice</div>
-      <div class="ctrl-body">
-        <label class="ctrl-label">Client</label>
-        <select id="selClient" disabled>
-          <option value="">Load data first…</option>
-        </select>
-        <label class="ctrl-label">Month</label>
-        <select id="selMonth" disabled>
-          <option value="">Select client first…</option>
-        </select>
-        <div class="btn-row">
-          <button class="btn btn-primary" id="btnDownload" disabled>Download PDF</button>
-          <button class="btn btn-send" id="btnSend" disabled title="Send invoice via email">✉ Send</button>
-        </div>
-        <div class="email-row hidden" id="emailRow">
-          <input type="email" id="emailInput" placeholder="recipient@example.com">
-          <button class="btn btn-mailto" id="btnMailto">Create email draft</button>
-        </div>
-      </div>
-    </div>
-    <div class="panel" id="summaryPanel" style="display:none">
-      <div class="panel-hdr">Client Total</div>
-      <div class="summary-body">
-        <div class="summary-month" id="summaryMonth"></div>
-        <div class="summary-total" id="summaryTotal"></div>
-        <div class="summary-projects" id="summaryProjects"></div>
-      </div>
-    </div>
-  </aside>
+<main class="main" id="view"></main>
 
-  <main class="main">
-    <div class="upload-zone" id="upZone">
-      <div class="source-split">
-        <div class="source-opt" id="srcLocal">
-          <div class="src-icon">📄</div>
-          <strong>Upload CSV</strong>
-          <p>Drag &amp; drop or click to browse</p>
-        </div>
-        <div class="source-div"></div>
-        <div class="source-opt" id="srcFabric">
-          <div class="src-icon" id="fabricIcon">⬡</div>
-          <strong>Load from Fabric</strong>
-          <p>Pull live data from OneLake</p>
-        </div>
-      </div>
-      <input type="file" id="fileInput" accept=".csv">
-    </div>
+<div class="toast" id="toast"></div>
 
-    <div class="inv-card hidden" id="invCard">
-      <div class="inv-card-hdr">
-        <div>
-          <div class="inv-co">Pioneer Management Consulting</div>
-          <div class="inv-meta">Invoice · <span id="invClient"></span> · <span id="invMonth"></span></div>
-        </div>
-        <div class="inv-logo">PMC</div>
-      </div>
-      <div class="tscroll">
-        <table>
-          <thead>
-            <tr>
-              <th style="text-align:left">Project</th>
-              <th>Amount</th>
-            </tr>
-          </thead>
-          <tbody id="invBody"></tbody>
-          <tfoot>
-            <tr class="inv-total-row">
-              <td>Total</td>
-              <td id="invTotal"></td>
-            </tr>
-          </tfoot>
-        </table>
-      </div>
-    </div>
-  </main>
-</div>
-
-<script type="module" src="main.js"></script>
+<script type="module" src="/main.js"></script>
 </body>
 </html>

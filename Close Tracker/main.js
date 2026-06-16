@@ -1,419 +1,645 @@
-import { jsPDF } from 'jspdf';
+import { supabase } from './src/supabase.js';
+import {
+  MONTH_ORDER, THRESHOLD,
+  fileToRows,
+  extractPLRevenue, extractProjectTotals, buildReconciliations, analyzeReconciliation,
+  extractCompanies, extractMonthsForCompany, extractProjectsForCompany,
+} from './src/reconcile.js';
 
-const MONTH_ORDER = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+// ── Constants ─────────────────────────────────────────────────────
+const QUARTERS = {
+  Q1: ['January','February','March'],
+  Q2: ['April','May','June'],
+  Q3: ['July','August','September'],
+  Q4: ['October','November','December'],
+};
 
-const upZone      = document.getElementById('upZone');
-const fileInput   = document.getElementById('fileInput');
-const srcLocal    = document.getElementById('srcLocal');
-const srcFabric   = document.getElementById('srcFabric');
-const fabricIcon  = document.getElementById('fabricIcon');
-const selClient   = document.getElementById('selClient');
-const selMonth    = document.getElementById('selMonth');
-const btnDownload = document.getElementById('btnDownload');
-const btnSend     = document.getElementById('btnSend');
-const emailRow    = document.getElementById('emailRow');
-const emailInput  = document.getElementById('emailInput');
-const btnMailto   = document.getElementById('btnMailto');
-const invCard     = document.getElementById('invCard');
-const summaryPanel= document.getElementById('summaryPanel');
-const sPill       = document.getElementById('sPill');
-const sTxt        = document.getElementById('sTxt');
+// ── State ────────────────────────────────────────────────────────
+let currentUser = null;
+let currentRole = null;
+const consultant = { projRows: null, selectedCompany: null, selectedMonth: null };
+const analyst    = {
+  plRows: null, projRows: null,
+  allRecords:     [],
+  analyzedMonths: {},
+  periodType:     'month',  // 'month' | 'quarter' | 'year'
+  period:         null,     // month name | 'Q1'-'Q4' | '2026'
+};
 
-let data = {}; // { client: { month: [{ project, revenue }] } }
+// ── DOM refs ─────────────────────────────────────────────────────
+const view        = document.getElementById('view');
+const toastEl     = document.getElementById('toast');
+const userInfoEl  = document.getElementById('userInfo');
+const userRoleEl  = document.getElementById('userRoleBadge');
+const userEmailEl = document.getElementById('userEmail');
 
-// ── Upload (local CSV) ────────────────────────────────────────────────────────
+const ROLE_LABEL = { director: 'Director', analyst: 'Analyst', cfo: 'CFO' };
+const STATUS = {
+  pending_analyst: { label: 'Pending Review', cls: 'st-amber' },
+  pending_cfo:     { label: 'Pending CFO',    cls: 'st-amber' },
+  approved:        { label: 'Approved',       cls: 'st-green' },
+  denied:          { label: 'Denied',         cls: 'st-red'   },
+};
 
-srcLocal.addEventListener('click', () => fileInput.click());
-upZone.addEventListener('dragover', e => { e.preventDefault(); upZone.classList.add('drag'); });
-upZone.addEventListener('dragleave', () => upZone.classList.remove('drag'));
-upZone.addEventListener('drop', e => {
-  e.preventDefault();
-  upZone.classList.remove('drag');
-  handleFile(e.dataTransfer.files[0]);
-});
-fileInput.addEventListener('change', e => handleFile(e.target.files[0]));
+// ── Utils ────────────────────────────────────────────────────────
+const money       = n => (n < 0 ? '-$' : '$') + Math.abs(Math.round(n)).toLocaleString('en-US');
+const esc         = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const sortByMonth = rows => [...rows].sort((a,b) => MONTH_ORDER.indexOf(a.month) - MONTH_ORDER.indexOf(b.month));
 
-// ── Load from Fabric ──────────────────────────────────────────────────────────
+let toastTimer;
+function toast(msg, kind = 'ok') {
+  toastEl.textContent = msg;
+  toastEl.className   = `toast show ${kind}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (toastEl.className = 'toast'), 3200);
+}
 
-srcFabric.addEventListener('click', async () => {
-  fabricIcon.textContent = '…';
-  srcFabric.classList.add('loading');
-  setStatus('progress', 'Connecting to Fabric…');
-  try {
-    const res = await fetch('http://localhost:5050/api/fabric-data');
-    if (!res.ok) throw new Error(`Server returned ${res.status}`);
-    const text = await res.text();
-    const rows = parseCSV(text);
-    if (rows.length < 2) throw new Error('No data returned');
-    data = buildIndex(rows.slice(1));
-    populateClients();
-    upZone.classList.add('hidden');
-    setStatus('progress', 'Fabric data loaded');
-  } catch (err) {
-    fabricIcon.textContent = '⚠';
-    srcFabric.classList.remove('loading');
-    setStatus('idle', 'Fabric connection failed');
-    alert(`Could not reach Fabric server.\n\nMake sure server.py is running:\n  python "Close Tracker/server.py"\n\nError: ${err.message}`);
-    fabricIcon.textContent = '⬡';
+function getSelectedMonths() {
+  const available = analyst.allRecords.map(r => r.month);
+  if (analyst.periodType === 'month')   return analyst.period ? [analyst.period] : [];
+  if (analyst.periodType === 'quarter') return (QUARTERS[analyst.period] || []).filter(m => available.includes(m));
+  if (analyst.periodType === 'year')    return available;
+  return [];
+}
+
+// ── Auth ─────────────────────────────────────────────────────────
+async function init() {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session) await onSignIn(session.user);
+  else renderLanding();
+
+  supabase.auth.onAuthStateChange(async (event, session) => {
+    if (event === 'SIGNED_IN' && session) await onSignIn(session.user);
+    else if (event === 'SIGNED_OUT') {
+      currentUser = null; currentRole = null;
+      setHeader(false); renderLanding();
+    }
+  });
+}
+
+async function onSignIn(user) {
+  currentUser = user;
+  const { data, error } = await supabase
+    .from('user_roles').select('role').eq('user_id', user.id).single();
+  if (error || !data) {
+    toast('No role assigned — contact your administrator.', 'err');
+    await supabase.auth.signOut(); return;
   }
-});
-
-async function handleFile(file) {
-  if (!file) return;
-  const buffer = await file.arrayBuffer();
-  const text = new TextDecoder('windows-1252').decode(buffer);
-  const rows = parseCSV(text);
-  if (rows.length < 2) return;
-
-  data = buildIndex(rows.slice(1));
-  populateClients();
-  upZone.classList.add('hidden');
-  setStatus('progress', 'Data loaded');
+  currentRole = data.role;
+  setHeader(true, user.email, currentRole);
+  renderForRole();
 }
 
-// ── CSV parsing ───────────────────────────────────────────────────────────────
-
-function parseCSV(text) {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim().split('\n').map(line => {
-    const fields = [];
-    let field = '', inQuotes = false;
-    for (const ch of line) {
-      if (ch === '"') { inQuotes = !inQuotes; }
-      else if (ch === ',' && !inQuotes) { fields.push(field.trim()); field = ''; }
-      else { field += ch; }
-    }
-    fields.push(field.trim());
-    return fields;
-  });
-}
-
-function parseCurrency(str) {
-  return parseFloat(String(str).replace(/[$,]/g, '')) || 0;
-}
-
-function buildIndex(rows) {
-  const index = {};
-  for (const [client, project, month, revenueStr] of rows) {
-    if (!client?.trim() || !month?.trim()) continue;
-    const c = client.trim(), m = month.trim();
-    const revenue = parseCurrency(revenueStr);
-    if (!index[c]) index[c] = {};
-    if (!index[c][m]) index[c][m] = [];
-    index[c][m].push({ project: project?.trim() ?? '', revenue });
+function setHeader(loggedIn, email = '', role = '') {
+  if (loggedIn) {
+    userRoleEl.textContent   = ROLE_LABEL[role] || role;
+    userEmailEl.textContent  = email;
+    userInfoEl.style.display = 'flex';
+  } else {
+    userInfoEl.style.display = 'none';
   }
-  return index;
 }
 
-// ── Dropdowns ─────────────────────────────────────────────────────────────────
+document.getElementById('homeBadge').addEventListener('click',  async () => supabase.auth.signOut());
+document.getElementById('btnSignOut').addEventListener('click', async () => supabase.auth.signOut());
+function renderForRole() {
+  if (currentRole === 'director') return renderConsultant();
+  if (currentRole === 'analyst')  return renderAnalyst();
+  if (currentRole === 'cfo')      return renderCFO();
+}
 
-function populateClients() {
-  selClient.innerHTML = '<option value="">Select client…</option>';
-  Object.keys(data).sort().forEach(c => {
-    const opt = document.createElement('option');
-    opt.value = c;
-    opt.textContent = c;
-    selClient.appendChild(opt);
+// ══════════════════════════════════════════════════════════════════
+// LANDING — Login
+// ══════════════════════════════════════════════════════════════════
+
+function renderLanding() {
+  view.innerHTML = `
+    <div class="landing">
+      <div class="landing-card">
+        <div class="landing-logo">
+          <div class="p-badge-lg">P</div>
+          <h1 class="landing-title">Close <em>Reconciliation</em></h1>
+          <p class="landing-sub">EPiC 2026 &middot; Pioneer Management Consulting</p>
+        </div>
+        <form class="login-form" id="loginForm" novalidate>
+          <div class="field-group">
+            <label class="field-lbl" for="loginEmail">Email</label>
+            <input class="field-input" type="email" id="loginEmail"
+              placeholder="you@thepioneerteam.com" required autocomplete="email">
+          </div>
+          <div class="field-group">
+            <label class="field-lbl" for="loginPw">Password</label>
+            <input class="field-input" type="password" id="loginPw"
+              placeholder="••••••••" required autocomplete="current-password">
+          </div>
+          <p class="login-err" id="loginErr"></p>
+          <button class="btn btn-primary btn-full" type="submit" id="btnLogin">Sign in</button>
+        </form>
+      </div>
+    </div>`;
+
+  document.getElementById('loginForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const email    = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPw').value;
+    const errEl    = document.getElementById('loginErr');
+    const btn      = document.getElementById('btnLogin');
+    btn.disabled = true; btn.textContent = 'Signing in…'; errEl.textContent = '';
+    await supabase.auth.signOut();
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) { errEl.textContent = error.message; btn.disabled = false; btn.textContent = 'Sign in'; }
   });
-  selClient.disabled = false;
 }
 
-selClient.addEventListener('change', () => {
-  const client = selClient.value;
-  selMonth.innerHTML = '<option value="">Select month…</option>';
-  invCard.classList.add('hidden');
-  summaryPanel.style.display = 'none';
-  btnDownload.disabled = true;
-  btnSend.disabled = true;
-  emailRow.classList.add('hidden');
+// ── Data layer ───────────────────────────────────────────────────
+async function fetchRecs() {
+  const { data, error } = await supabase.from('reconciliations').select('*');
+  if (error) { toast(error.message, 'err'); return []; }
+  return sortByMonth(data);
+}
 
-  if (!client) { selMonth.disabled = true; return; }
+async function upsertRec(rec) {
+  const { error } = await supabase.from('reconciliations').upsert({
+    month: rec.month, year: rec.year,
+    pl_revenue: rec.pl_revenue, projects_total: rec.projects_total,
+    claude_analysis: rec.claude_analysis,
+    status: 'pending_cfo',
+    analyst_user_id: currentUser?.id ?? null,
+    analyst_confirmed_at: new Date().toISOString(),
+    cfo_user_id: null, cfo_decided_at: null, denial_note: null,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'month,year' });
+  if (error) { toast(error.message, 'err'); return false; }
+  return true;
+}
 
-  const months = Object.keys(data[client]).sort(
-    (a, b) => MONTH_ORDER.indexOf(a) - MONTH_ORDER.indexOf(b)
-  );
-  months.forEach(m => {
-    const opt = document.createElement('option');
-    opt.value = m;
-    opt.textContent = m;
-    selMonth.appendChild(opt);
+async function updateStatus(id, patch) {
+  const { error } = await supabase
+    .from('reconciliations')
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq('id', id);
+  if (error) { toast(error.message, 'err'); return false; }
+  return true;
+}
+
+// ── CSV download ─────────────────────────────────────────────────
+function downloadCSV(recs, filename) {
+  const headers = ['Month','Year','P&L Revenue','Projects Total','Variance','% Variance','Status'];
+  const rows = recs.map(r => {
+    const v = r.projects_total - r.pl_revenue;
+    const pct = r.pl_revenue ? (v / Math.abs(r.pl_revenue)) * 100 : 0;
+    return [r.month, r.year || 2026, r.pl_revenue, r.projects_total, v, pct.toFixed(1) + '%', r.status]
+      .map(val => `"${String(val).replace(/"/g,'""')}"`).join(',');
   });
-  selMonth.disabled = false;
-});
-
-selMonth.addEventListener('change', () => {
-  const client = selClient.value;
-  const month  = selMonth.value;
-  if (client && month) renderInvoice(client, month);
-});
-
-// ── Invoice render ────────────────────────────────────────────────────────────
-
-function fmt(n) {
-  return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function renderInvoice(client, month) {
-  const lineItems = data[client][month];
-  const total = lineItems.reduce((s, r) => s + r.revenue, 0);
-
-  document.getElementById('invClient').textContent = client;
-  document.getElementById('invMonth').textContent  = `${month} 2026`;
-  document.getElementById('invTotal').textContent  = `$${fmt(total)}`;
-
-  document.getElementById('invBody').innerHTML = lineItems.map(({ project, revenue }) =>
-    `<tr><td>${project}</td><td>$${fmt(revenue)}</td></tr>`
-  ).join('');
-
-  // Sidebar summary
-  document.getElementById('summaryMonth').textContent    = month;
-  document.getElementById('summaryTotal').textContent    = `$${fmt(total)}`;
-  document.getElementById('summaryProjects').textContent = `${lineItems.length} project${lineItems.length !== 1 ? 's' : ''}`;
-  summaryPanel.style.display = 'block';
-
-  invCard.classList.remove('hidden');
-  btnDownload.disabled = false;
-  btnSend.disabled = false;
-  setStatus('closed', 'Invoice ready');
-
-  // Cache for download
-  invCard.dataset.client = client;
-  invCard.dataset.month  = month;
-}
-
-// ── Download PDF ──────────────────────────────────────────────────────────────
-
-btnDownload.addEventListener('click', () => {
-  const client = invCard.dataset.client;
-  const month  = invCard.dataset.month;
-  buildPDFDoc(client, month, data[client][month])
-    .save(`${client} - ${month} 2026.pdf`);
-});
-
-function generatePDF(client, month, lineItems) {
-  buildPDFDoc(client, month, lineItems).save(`${client} - ${month} 2026.pdf`);
-}
-
-function buildPDFDoc(client, month, lineItems) {
-  const doc = new jsPDF({ unit: 'pt', format: 'letter' });
-  const W = 612, H = 792, ML = 54, MR = 54;
-  const contentW = W - ML - MR;
-  const right    = W - MR;
-  const total    = lineItems.reduce((s, r) => s + r.revenue, 0);
-  const monthNum = String(MONTH_ORDER.indexOf(month) + 1).padStart(2, '0');
-  const invoiceNum = `PMC-2026-${monthNum}`;
-
-  const G900   = [45,  41,  38];   // Pioneer dark #2D2926
-  const G500   = [87, 161, 119];   // Pioneer green #57A177
-  const GR900  = [45,  41,  38];   // Pioneer dark
-  const GR600  = [92,  86,  80];   // warm mid-gray
-  const GR400  = [156,150, 144];   // warm light gray
-  const GR200  = [214,210, 196];   // Pioneer beige #D6D2C4
-  const GR50   = [247,245, 242];   // warm off-white
-  const WHITE  = [255,255, 255];
-  const ROW_H  = 23;
-
-  // ── Header banner ───────────────────────────────────────────────────────────
-  doc.setFillColor(...G900);
-  doc.rect(0, 0, W, 84, 'F');
-
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(17);
-  doc.setTextColor(...WHITE);
-  doc.text('PIONEER MANAGEMENT CONSULTING', ML, 36);
-
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8.5);
-  doc.setTextColor(...G500);
-  doc.text('Management Consulting', ML, 54);
-
-  // PMC badge
-  doc.setDrawColor(...G500);
-  doc.setLineWidth(1.5);
-  doc.rect(right - 46, 22, 46, 26);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9);
-  doc.setTextColor(...G500);
-  doc.text('PMC', right - 23, 40, { align: 'center' });
-
-  // ── Invoice title ───────────────────────────────────────────────────────────
-  let y = 116;
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(28);
-  doc.setTextColor(...G900);
-  doc.text('INVOICE', ML, y);
-
-  y += 34;
-
-  // ── Bill-to / meta row ──────────────────────────────────────────────────────
-  const c2 = ML + contentW * 0.45;
-  const c3 = ML + contentW * 0.70;
-
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(7);
-  doc.setTextColor(...GR400);
-  doc.text('BILLED TO',    ML, y);
-  doc.text('INVOICE #',    c2, y);
-  doc.text('INVOICE DATE', c3, y);
-
-  y += 14;
-
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11.5);
-  doc.setTextColor(...GR900);
-  // Truncate very long client names
-  const clientLabel = doc.splitTextToSize(client, c2 - ML - 8)[0];
-  doc.text(clientLabel, ML, y);
-
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(10);
-  doc.setTextColor(...GR600);
-  doc.text(invoiceNum,    c2, y);
-  doc.text(`${month} 2026`, c3, y);
-
-  y += 30;
-
-  // ── Divider ─────────────────────────────────────────────────────────────────
-  doc.setDrawColor(...GR200);
-  doc.setLineWidth(1);
-  doc.line(ML, y, right, y);
-  y += 18;
-
-  // ── Table header ────────────────────────────────────────────────────────────
-  doc.setFillColor(...GR50);
-  doc.rect(ML, y, contentW, ROW_H, 'F');
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(7.5);
-  doc.setTextColor(...GR400);
-  doc.text('PROJECT', ML + 8, y + 15);
-  doc.text('AMOUNT',  right - 8, y + 15, { align: 'right' });
-  y += ROW_H;
-
-  // ── Line items ───────────────────────────────────────────────────────────────
-  const maxProjW = contentW - 120;
-  doc.setFontSize(9.5);
-
-  lineItems.forEach(({ project, revenue }, i) => {
-    if (y > H - 110) {
-      doc.addPage();
-      y = ML;
-    }
-
-    if (i % 2 === 1) {
-      doc.setFillColor(...GR50);
-      doc.rect(ML, y, contentW, ROW_H, 'F');
-    }
-
-    const label = doc.splitTextToSize(project, maxProjW)[0];
-
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(...GR900);
-    doc.text(label, ML + 8, y + 15);
-
-    doc.setTextColor(...GR600);
-    doc.text(`$${fmt(revenue)}`, right - 8, y + 15, { align: 'right' });
-
-    y += ROW_H;
-  });
-
-  // ── Total bar ────────────────────────────────────────────────────────────────
-  const TOTAL_H = 34;
-  doc.setFillColor(...G900);
-  doc.rect(ML, y, contentW, TOTAL_H, 'F');
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.setTextColor(...WHITE);
-  doc.text('TOTAL',        ML + 8,   y + 21);
-  doc.text(`$${fmt(total)}`, right - 8, y + 21, { align: 'right' });
-
-  // ── Footer ───────────────────────────────────────────────────────────────────
-  const generated = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
-  doc.setDrawColor(...GR200);
-  doc.setLineWidth(0.5);
-  doc.line(ML, H - 46, right, H - 46);
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(7.5);
-  doc.setTextColor(...GR400);
-  doc.text(
-    `Pioneer Management Consulting  ·  Confidential  ·  Generated ${generated}`,
-    W / 2, H - 30, { align: 'center' }
-  );
-
-  return doc;
-}
-
-// ── Send — EML with PDF attachment ───────────────────────────────────────────
-
-btnSend.addEventListener('click', () => {
-  emailRow.classList.toggle('hidden');
-  if (!emailRow.classList.contains('hidden')) emailInput.focus();
-});
-
-btnMailto.addEventListener('click', () => {
-  const to     = emailInput.value.trim();
-  const client = invCard.dataset.client;
-  const month  = invCard.dataset.month;
-  const items  = data[client][month];
-  generateEML(to, client, month, items);
-});
-
-function generateEML(to, client, month, lineItems) {
-  const total    = lineItems.reduce((s, r) => s + r.revenue, 0);
-  const filename = `${client} - ${month} 2026.pdf`;
-  const subject  = `Invoice – ${client} – ${month} 2026`;
-
-  // Get PDF as base64
-  const pdfBuffer = buildPDFDoc(client, month, lineItems).output('arraybuffer');
-  const pdfBytes  = new Uint8Array(pdfBuffer);
-  let binary = '';
-  pdfBytes.forEach(b => binary += String.fromCharCode(b));
-  const pdfB64 = btoa(binary).match(/.{1,76}/g).join('\r\n');
-
-  // Plain-text body
-  const textBody = [
-    'Pioneer Management Consulting',
-    `Invoice · ${client} · ${month} 2026`,
-    '',
-    ...lineItems.map(({ project, revenue }) => `  ${project}:  $${fmt(revenue)}`),
-    '',
-    `Total:  $${fmt(total)}`,
-  ].join('\r\n');
-
-  const boundary = `----=_PMC_${Date.now()}`;
-
-  const eml = [
-    'MIME-Version: 1.0',
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    `Content-Type: multipart/mixed; boundary="${boundary}"`,
-    '',
-    `--${boundary}`,
-    'Content-Type: text/plain; charset=utf-8',
-    'Content-Transfer-Encoding: 7bit',
-    '',
-    textBody,
-    '',
-    `--${boundary}`,
-    `Content-Type: application/pdf; name="${filename}"`,
-    `Content-Disposition: attachment; filename="${filename}"`,
-    'Content-Transfer-Encoding: base64',
-    '',
-    pdfB64,
-    '',
-    `--${boundary}--`,
-  ].join('\r\n');
-
-  const blob = new Blob([eml], { type: 'message/rfc822' });
+  const csv  = [headers.join(','), ...rows].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement('a');
-  a.href = url;
-  a.download = `Invoice - ${client} - ${month}.eml`;
-  a.click();
+  a.href = url; a.download = filename; a.click();
   URL.revokeObjectURL(url);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+// DIRECTOR — Invoice generator
+// ══════════════════════════════════════════════════════════════════
 
-function setStatus(state, text) {
-  sPill.dataset.s = state;
-  sTxt.textContent = text;
+async function renderConsultant() {
+  view.innerHTML = `
+    <section class="card">
+      <h1>Generate invoice</h1>
+      <p class="sub">Upload the projects file, then select a client and billing month to preview and send the invoice.</p>
+      <div class="source-row">
+        <label class="drop ${consultant.projRows ? 'loaded' : ''}" id="drop-cproj">
+          <input type="file" id="file-cproj" accept=".csv,.xlsx,.xls" hidden>
+          <div class="drop-icon">${consultant.projRows ? '✓' : '📄'}</div>
+          <strong>Projects / Revenue file</strong>
+          <span>${consultant.projRows ? 'Loaded — click to replace' : 'Click or drop CSV / XLSX'}</span>
+        </label>
+        <button class="btn fabric-btn" id="btnFabric">
+          <span class="fabric-icon">⬡</span> Load from Fabric
+        </button>
+      </div>
+      <div id="invoiceWrap"></div>
+    </section>`;
+
+  const drop  = document.getElementById('drop-cproj');
+  const input = document.getElementById('file-cproj');
+  input.addEventListener('change', e => e.target.files[0] && loadConsultantFile(e.target.files[0]));
+  drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('drag'); });
+  drop.addEventListener('dragleave', ()  => drop.classList.remove('drag'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault(); drop.classList.remove('drag');
+    if (e.dataTransfer.files[0]) loadConsultantFile(e.dataTransfer.files[0]);
+  });
+  document.getElementById('btnFabric').addEventListener('click', () =>
+    toast('Fabric connection is managed by the DA Team — contact them to enable live data.', 'err')
+  );
+  if (consultant.projRows) renderInvoiceSelectors();
 }
+
+async function loadConsultantFile(file) {
+  try { consultant.projRows = await fileToRows(file); }
+  catch (err) { toast(`Could not read ${file.name}: ${err.message}`, 'err'); return; }
+  consultant.selectedCompany = null; consultant.selectedMonth = null;
+  renderConsultant();
+}
+
+function renderInvoiceSelectors() {
+  const wrap = document.getElementById('invoiceWrap');
+  if (!wrap) return;
+  const companies = extractCompanies(consultant.projRows);
+  if (!companies.length) { wrap.innerHTML = '<p class="hint err-text">No companies found in file.</p>'; return; }
+  if (!consultant.selectedCompany || !companies.includes(consultant.selectedCompany))
+    consultant.selectedCompany = companies[0];
+  const months = extractMonthsForCompany(consultant.projRows, consultant.selectedCompany);
+  if (!consultant.selectedMonth || !months.includes(consultant.selectedMonth))
+    consultant.selectedMonth = months[0] || null;
+
+  const coOpts = companies.map(c => `<option value="${esc(c)}" ${c === consultant.selectedCompany ? 'selected' : ''}>${esc(c)}</option>`).join('');
+  const moOpts = months.length
+    ? months.map(m => `<option value="${esc(m)}" ${m === consultant.selectedMonth ? 'selected' : ''}>${esc(m)}</option>`).join('')
+    : '<option>—</option>';
+
+  wrap.innerHTML = `
+    <div class="selector-row">
+      <div class="select-group">
+        <label class="sel-lbl" for="selCo">Client</label>
+        <select class="sel" id="selCo">${coOpts}</select>
+      </div>
+      <div class="select-group">
+        <label class="sel-lbl" for="selMo">Month</label>
+        <select class="sel" id="selMo"${!months.length ? ' disabled' : ''}>${moOpts}</select>
+      </div>
+    </div>
+    <div id="invoiceCard">${consultant.selectedMonth ? buildInvoiceHTML() : ''}</div>`;
+
+  document.getElementById('selCo').addEventListener('change', e => {
+    consultant.selectedCompany = e.target.value; consultant.selectedMonth = null;
+    renderInvoiceSelectors();
+  });
+  document.getElementById('selMo').addEventListener('change', e => {
+    consultant.selectedMonth = e.target.value;
+    const card = document.getElementById('invoiceCard');
+    if (card) card.innerHTML = buildInvoiceHTML();
+  });
+}
+
+function buildInvoiceHTML() {
+  const { selectedCompany: co, selectedMonth: mo, projRows } = consultant;
+  if (!co || !mo) return '';
+  const projects = extractProjectsForCompany(projRows, co, mo);
+  if (!projects.length) return '<p class="hint">No projects found for this selection.</p>';
+  const total       = projects.reduce((s,p) => s + p.revenue, 0);
+  const projectRows = projects.map(p => `<tr><td>${esc(p.project)}</td><td class="num">${money(p.revenue)}</td></tr>`).join('');
+  const bodyLines   = ['Pioneer Management Consulting',`Invoice: ${co}`,`Period: ${mo} 2026`,'',
+    ...projects.map(p=>`${p.project}: ${money(p.revenue)}`),'',`Total: ${money(total)}`,'',
+    'Generated by EPiC Close Reconciliation'].join('\n');
+  const subject = encodeURIComponent(`Invoice: ${co} — ${mo} 2026`);
+  const body    = encodeURIComponent(bodyLines);
+  return `
+    <div class="invoice-card">
+      <div class="invoice-hdr">
+        <div><div class="invoice-title">${esc(co)}</div><div class="invoice-period">${esc(mo)} 2026</div></div>
+        <a class="btn btn-primary" href="mailto:?subject=${subject}&body=${body}">Send Invoice</a>
+      </div>
+      <div class="tscroll">
+        <table class="ledger">
+          <thead><tr><th>Project</th><th class="num">Revenue</th></tr></thead>
+          <tbody>${projectRows}</tbody>
+          <tfoot><tr class="total-row"><td><strong>Total</strong></td><td class="num"><strong>${money(total)}</strong></td></tr></tfoot>
+        </table>
+      </div>
+    </div>`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ANALYST — P&L reconciliation with period selector
+// ══════════════════════════════════════════════════════════════════
+
+async function renderAnalyst() {
+  if (analyst.plRows && analyst.projRows && !analyst.allRecords.length) {
+    analyst.allRecords = buildReconciliations(
+      extractPLRevenue(analyst.plRows),
+      extractProjectTotals(analyst.projRows),
+    );
+    if (analyst.allRecords.length && !analyst.period)
+      analyst.period = analyst.allRecords[0].month;
+  }
+
+  const available  = analyst.allRecords.map(r => r.month);
+  const hasFiles   = analyst.plRows && analyst.projRows;
+  const hasData    = hasFiles && available.length > 0;
+
+  // Build period selector HTML
+  let periodHTML = '';
+  if (!hasFiles) {
+    periodHTML = '<p class="hint">Upload both files to run the discrepancy check.</p>';
+  } else if (!hasData) {
+    periodHTML = '<p class="hint err-text">No overlapping months found. Check file formats.</p>';
+  } else {
+    // Validate current period selection
+    if (analyst.periodType === 'month' && (!analyst.period || !available.includes(analyst.period)))
+      analyst.period = available[0];
+    if (analyst.periodType === 'quarter') {
+      const qs = Object.keys(QUARTERS).filter(q => QUARTERS[q].some(m => available.includes(m)));
+      if (!analyst.period || !qs.includes(analyst.period)) analyst.period = qs[0];
+    }
+    if (analyst.periodType === 'year') analyst.period = '2026';
+
+    let periodDropdown = '';
+    if (analyst.periodType === 'month') {
+      const opts = available.map(m => `<option value="${esc(m)}" ${m === analyst.period ? 'selected':''}>${esc(m)} 2026</option>`).join('');
+      periodDropdown = `<div class="select-group"><select class="sel" id="selPeriod">${opts}</select></div>`;
+    } else if (analyst.periodType === 'quarter') {
+      const qs   = Object.keys(QUARTERS).filter(q => QUARTERS[q].some(m => available.includes(m)));
+      const opts = qs.map(q => `<option value="${q}" ${q === analyst.period ? 'selected':''}>${q} 2026</option>`).join('');
+      periodDropdown = `<div class="select-group"><select class="sel" id="selPeriod">${opts}</select></div>`;
+    }
+
+    periodHTML = `
+      <div class="period-row">
+        <div class="period-type-group">
+          <button class="period-btn ${analyst.periodType==='month'   ? 'active':''}" data-type="month">Month</button>
+          <button class="period-btn ${analyst.periodType==='quarter' ? 'active':''}" data-type="quarter">Quarter</button>
+          <button class="period-btn ${analyst.periodType==='year'    ? 'active':''}" data-type="year">Year</button>
+        </div>
+        ${periodDropdown}
+      </div>
+      <div id="periodAnalysis"></div>`;
+  }
+
+  view.innerHTML = `
+    <section class="card">
+      <h1>P&L reconciliation</h1>
+      <p class="sub">Select a reporting period to verify whether the P&L revenue matches the sum of client project revenues.</p>
+      <div class="drops">
+        ${dropHTML('pl',   'P&L (financial actuals)', analyst.plRows)}
+        ${dropHTML('proj', 'Projects by company',     analyst.projRows)}
+      </div>
+      ${periodHTML}
+    </section>`;
+
+  wireAnalystDrop('pl',   'plRows');
+  wireAnalystDrop('proj', 'projRows');
+
+  view.querySelectorAll('.period-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      analyst.periodType = btn.dataset.type;
+      analyst.period     = null;
+      renderAnalyst();
+    });
+  });
+
+  document.getElementById('selPeriod')?.addEventListener('change', e => {
+    analyst.period = e.target.value;
+    document.getElementById('periodAnalysis').innerHTML = '<p class="hint">Running Claude discrepancy check…</p>';
+    renderPeriodAnalysis();
+  });
+
+  if (hasData && analyst.period) renderPeriodAnalysis();
+}
+
+async function renderPeriodAnalysis() {
+  const wrap = document.getElementById('periodAnalysis');
+  if (!wrap) return;
+
+  const selectedMonths = getSelectedMonths();
+  if (!selectedMonths.length) { wrap.innerHTML = '<p class="hint">No data for this period.</p>'; return; }
+
+  // Run Claude for uncached months
+  const uncached = selectedMonths.filter(m => !analyst.analyzedMonths[m]);
+  if (uncached.length) {
+    wrap.innerHTML = '<p class="hint">Running Claude discrepancy check…</p>';
+    const results = await Promise.all(uncached.map(m =>
+      analyzeReconciliation(analyst.allRecords.find(r => r.month === m))
+    ));
+    uncached.forEach((m, i) => { analyst.analyzedMonths[m] = results[i]; });
+  }
+
+  const recs = selectedMonths.map(m => ({
+    ...analyst.allRecords.find(r => r.month === m),
+    claude_analysis: analyst.analyzedMonths[m],
+  }));
+
+  const existing = await fetchRecs();
+  const byMonth  = Object.fromEntries(existing.map(r => [r.month, r]));
+  const merged   = recs.map(r => ({
+    ...r,
+    id:          byMonth[r.month]?.id          ?? null,
+    status:      byMonth[r.month]?.status      ?? 'new',
+    denial_note: byMonth[r.month]?.denial_note ?? null,
+  }));
+
+  // Table rows
+  const rows = merged.map(r => {
+    const v   = r.projects_total - r.pl_revenue;
+    const pct = r.pl_revenue ? (v / Math.abs(r.pl_revenue)) * 100 : 0;
+    const mat = Math.abs(pct) >= THRESHOLD;
+    const st  = STATUS[r.status];
+    const badge = st
+      ? `<span class="st ${st.cls}">${st.label}</span>`
+      : `<span class="pill ${mat ? 'pill-bad':'pill-ok'}">${mat ? 'Discrepancy':'Ties out'}</span>`;
+    return `
+      <tr>
+        <td>${esc(r.month)} 2026</td>
+        <td class="num">${money(r.pl_revenue)}</td>
+        <td class="num">${money(r.projects_total)}</td>
+        <td class="num ${mat ? 'bad':''}">${v>=0?'+':''}${money(v)}</td>
+        <td class="num"><span class="pct ${mat?'pill-bad':'pill-ok'}">${pct>=0?'+':''}${pct.toFixed(1)}%</span></td>
+        <td>${badge}</td>
+      </tr>
+      <tr class="analysis-row">
+        <td colspan="6"><span class="ai-tag">Claude</span> ${esc(r.claude_analysis)}
+          ${r.denial_note ? `<div class="deny-note">Denied: ${esc(r.denial_note)}</div>` : ''}
+        </td>
+      </tr>`;
+  }).join('');
+
+  // Summary row for multi-month periods
+  let summaryHTML = '';
+  if (merged.length > 1) {
+    const tPL   = merged.reduce((s,r) => s + r.pl_revenue, 0);
+    const tProj = merged.reduce((s,r) => s + r.projects_total, 0);
+    const tV    = tProj - tPL;
+    const tPct  = tPL ? (tV / Math.abs(tPL)) * 100 : 0;
+    const tMat  = Math.abs(tPct) >= THRESHOLD;
+    summaryHTML = `
+      <tr class="total-row">
+        <td><strong>Period Total</strong></td>
+        <td class="num"><strong>${money(tPL)}</strong></td>
+        <td class="num"><strong>${money(tProj)}</strong></td>
+        <td class="num ${tMat?'bad':''}"><strong>${tV>=0?'+':''}${money(tV)}</strong></td>
+        <td class="num"><strong><span class="pct ${tMat?'pill-bad':'pill-ok'}">${tPct>=0?'+':''}${tPct.toFixed(1)}%</span></strong></td>
+        <td></td>
+      </tr>`;
+  }
+
+  const canSubmit = merged.filter(r => ['new','pending_analyst','denied'].includes(r.status));
+  const canReset  = merged.filter(r => r.status === 'approved');
+
+  wrap.innerHTML = `
+    <div class="tscroll" style="margin-top:1rem;">
+      <table class="ledger">
+        <thead><tr>
+          <th>Month</th><th class="num">P&amp;L Revenue</th><th class="num">Projects Total</th>
+          <th class="num">Variance</th><th class="num">%</th><th>Status</th>
+        </tr></thead>
+        <tbody>${rows}${summaryHTML}</tbody>
+      </table>
+    </div>
+    <div class="actions-row">
+      ${canSubmit.length ? `<button class="btn btn-primary" id="btnSubmitPeriod">Submit ${canSubmit.length} month${canSubmit.length!==1?'s':''} to CFO</button>` : ''}
+      ${canReset.length  ? `<button class="btn btn-deny" id="btnResetPeriod">Reset ${canReset.length} approval${canReset.length!==1?'s':''}</button>` : ''}
+    </div>`;
+
+  document.getElementById('btnSubmitPeriod')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btnSubmitPeriod');
+    btn.disabled = true;
+    await Promise.all(canSubmit.map(r => upsertRec(r)));
+    toast(`${canSubmit.length} month${canSubmit.length!==1?'s':''} submitted for CFO review.`);
+    renderPeriodAnalysis();
+  });
+
+  document.getElementById('btnResetPeriod')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btnResetPeriod');
+    btn.disabled = true;
+    await Promise.all(canReset.map(r =>
+      updateStatus(r.id, { status:'pending_analyst', cfo_user_id:null, cfo_decided_at:null, denial_note:null })
+    ));
+    toast('Approvals reset.');
+    renderPeriodAnalysis();
+  });
+}
+
+function dropHTML(id, label, loaded) {
+  return `
+    <label class="drop ${loaded?'loaded':''}" id="drop-${id}">
+      <input type="file" id="file-${id}" accept=".csv,.xlsx,.xls" hidden>
+      <div class="drop-icon">${loaded?'✓':'📄'}</div>
+      <strong>${label}</strong>
+      <span>${loaded?'Loaded — click to replace':'Click or drop CSV / XLSX'}</span>
+    </label>`;
+}
+
+function wireAnalystDrop(id, key) {
+  const drop  = document.getElementById(`drop-${id}`);
+  const input = document.getElementById(`file-${id}`);
+  input.addEventListener('change', e => e.target.files[0] && loadAnalystFile(e.target.files[0], key));
+  drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('drag'); });
+  drop.addEventListener('dragleave', ()  => drop.classList.remove('drag'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault(); drop.classList.remove('drag');
+    if (e.dataTransfer.files[0]) loadAnalystFile(e.dataTransfer.files[0], key);
+  });
+}
+
+async function loadAnalystFile(file, key) {
+  try { analyst[key] = await fileToRows(file); }
+  catch (err) { toast(`Could not read ${file.name}: ${err.message}`, 'err'); return; }
+  analyst.allRecords = []; analyst.analyzedMonths = {};
+  analyst.periodType = 'month'; analyst.period = null;
+  renderAnalyst();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// CFO — Sign-off (pending queue only + download approved)
+// ══════════════════════════════════════════════════════════════════
+
+async function renderCFO() {
+  const allRecs      = await fetchRecs();
+  const pendingRecs  = allRecs.filter(r => r.status === 'pending_cfo');
+  const approvedRecs = sortByMonth(allRecs.filter(r => r.status === 'approved'));
+
+  view.innerHTML = `
+    <section class="card">
+      <h1>CFO sign-off</h1>
+      <p class="sub">Review pending reconciliations. Deny individual months or approve all at once.</p>
+      ${pendingRecs.length ? cfoTable(pendingRecs) : '<p class="hint">No months pending review.</p>'}
+      <div class="actions-row" style="gap:0.75rem;">
+        ${pendingRecs.length ? `
+          <button class="btn btn-primary" id="btnApproveAll">
+            Approve all (${pendingRecs.length} month${pendingRecs.length!==1?'s':''})
+          </button>` : ''}
+        ${approvedRecs.length ? `
+          <button class="btn" id="btnDownload">
+            Download approved (${approvedRecs.length} month${approvedRecs.length!==1?'s':''})
+          </button>` : ''}
+      </div>
+    </section>`;
+
+  wireCFOActions(pendingRecs, approvedRecs);
+}
+
+function wireCFOActions(pendingRecs, approvedRecs) {
+  view.querySelectorAll('button[data-act="deny"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const note = prompt('Reason for denial:');
+      if (note === null) return;
+      btn.disabled = true;
+      const ok = await updateStatus(btn.dataset.id, {
+        status:'denied', cfo_user_id: currentUser?.id ?? null,
+        cfo_decided_at: new Date().toISOString(), denial_note: note,
+      });
+      if (ok) { toast('Denied.', 'err'); renderCFO(); }
+      else btn.disabled = false;
+    });
+  });
+
+  document.getElementById('btnApproveAll')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btnApproveAll');
+    btn.disabled = true; btn.textContent = 'Approving…';
+    await Promise.all(pendingRecs.map(r =>
+      updateStatus(r.id, {
+        status:'approved', cfo_user_id: currentUser?.id ?? null,
+        cfo_decided_at: new Date().toISOString(),
+      })
+    ));
+    toast(`${pendingRecs.length} month${pendingRecs.length!==1?'s':''} approved.`);
+    renderCFO();
+  });
+
+  document.getElementById('btnDownload')?.addEventListener('click', () => {
+    downloadCSV(approvedRecs, `reconciliation-approved-${new Date().toISOString().slice(0,10)}.csv`);
+  });
+}
+
+function cfoTable(recs) {
+  const rows = recs.map(r => {
+    const v   = r.projects_total - r.pl_revenue;
+    const pct = r.pl_revenue ? (v / Math.abs(r.pl_revenue)) * 100 : 0;
+    const mat = Math.abs(pct) >= THRESHOLD;
+    const st  = STATUS[r.status];
+    const badge  = st ? `<span class="st ${st.cls}">${st.label}</span>` : '—';
+    const action = r.status === 'pending_cfo'
+      ? `<button class="btn btn-sm btn-deny" data-act="deny" data-id="${r.id}">Deny</button>`
+      : '<span class="muted">—</span>';
+    return `
+      <tr>
+        <td>${esc(r.month)} ${r.year||2026}</td>
+        <td class="num">${money(r.pl_revenue)}</td>
+        <td class="num">${money(r.projects_total)}</td>
+        <td class="num ${mat?'bad':''}">${v>=0?'+':''}${money(v)}</td>
+        <td class="num"><span class="pct ${mat?'pill-bad':'pill-ok'}">${pct>=0?'+':''}${pct.toFixed(1)}%</span></td>
+        <td>${badge}</td>
+        <td class="act">${action}</td>
+      </tr>
+      <tr class="analysis-row">
+        <td colspan="7"><span class="ai-tag">Claude</span> ${esc(r.claude_analysis)||'—'}
+          ${r.denial_note?`<div class="deny-note">Denied: ${esc(r.denial_note)}</div>`:''}
+        </td>
+      </tr>`;
+  }).join('');
+
+  return `
+    <div class="tscroll">
+      <table class="ledger">
+        <thead><tr>
+          <th>Month</th><th class="num">P&amp;L Revenue</th><th class="num">Projects Total</th>
+          <th class="num">Variance</th><th class="num">%</th><th>Status</th><th>Action</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+init();
