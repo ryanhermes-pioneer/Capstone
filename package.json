@@ -4,14 +4,16 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build \"Close Tracker\"",
     "preview": "vite preview"
   },
   "devDependencies": {
     "vite": "^6.3.5"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.1",
     "@supabase/supabase-js": "^2.45.0",
+    "jspdf": "^4.2.1",
     "xlsx": "^0.18.5"
   }
 }
