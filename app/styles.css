@@ -331,7 +331,8 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
 
 /* ── Audit trail ── */
 .audit-card { margin-top: 0; }
-.audit-hdr { font-size: 0.85rem; font-weight: 600; color: var(--gray4); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.75rem; }
+.audit-hdr-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; }
+.audit-hdr { font-size: 0.85rem; font-weight: 600; color: var(--gray4); text-transform: uppercase; letter-spacing: 0.06em; margin: 0; }
 
 /* ── Invoice card ── */
 .invoice-card { margin-top: 1.5rem; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }

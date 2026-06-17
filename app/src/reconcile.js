@@ -148,7 +148,7 @@ P&L revenue: ${fmt(pl_revenue)}
 Projects total: ${fmt(projects_total)}
 Variance: ${sign}${fmt(variance)} (${pct.toFixed(1)}%)${lineBlock}
 
-Write 1–2 short sentences. Name the specific client(s) most likely driving the variance, drilled to the exact line item if possible. Also, identify what the analyst should verify. Keep it concise..`,
+Write 1–2 short sentences. Name the specific client(s) most likely driving the variance, drilled to the exact line item if possible. Also, identify what the analyst should verify. Keep it concise.`,
       }],
     });
     return response.content.find(b => b.type === 'text')?.text?.trim() || fallbackAnalysis(rec, lineItems);
