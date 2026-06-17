@@ -1,62 +1,216 @@
 import { supabase } from './src/supabase.js';
+import { downloadInvoicePDF } from './src/invoice.js';
 import {
-  MONTH_ORDER, fileToRows, extractPLRevenue, extractProjectTotals,
-  buildReconciliations, analyzeReconciliation, THRESHOLD,
+  MONTH_ORDER, THRESHOLD,
+  fileToRows,
+  extractPLRevenue, extractProjectTotals, buildReconciliations, analyzeReconciliation,
+  extractCompanies, extractMonthsForCompany, extractProjectsForCompany,
 } from './src/reconcile.js';
 
-// ── State ───────────────────────────────────────────────────────
-let role = 'consultant';
-const upload = { plRows: null, projRows: null, preview: [] };
-
-const view  = document.getElementById('view');
-const toastEl = document.getElementById('toast');
-
-// ── Status metadata ─────────────────────────────────────────────
-const STATUS = {
-  pending_analyst: { label: 'Pending Analyst', cls: 'st-amber' },
-  pending_cfo:     { label: 'Pending CFO',     cls: 'st-blue'  },
-  approved:        { label: 'Approved',        cls: 'st-green' },
-  denied:          { label: 'Denied',          cls: 'st-red'   },
+// ── Constants ─────────────────────────────────────────────────────
+const QUARTERS = {
+  Q1: ['January','February','March'],
+  Q2: ['April','May','June'],
+  Q3: ['July','August','September'],
+  Q4: ['October','November','December'],
 };
 
-// ── Utils ───────────────────────────────────────────────────────
-const money = n => (n < 0 ? '-$' : '$') + Math.abs(Math.round(n)).toLocaleString('en-US');
-const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-const sortByMonth = rows => [...rows].sort((a, b) => MONTH_ORDER.indexOf(a.month) - MONTH_ORDER.indexOf(b.month));
+// ── State ────────────────────────────────────────────────────────
+let currentUser = null;
+let currentRole = null;
+const consultant = { projRows: null, selectedCompany: null, selectedMonth: null };
+const analyst    = {
+  plRows: null, projRows: null,
+  allRecords:     [],
+  analyzedMonths: {},
+  periodType:     'month',  // 'month' | 'quarter' | 'year'
+  period:         null,     // month name | 'Q1'-'Q4' | '2026'
+};
+
+// ── DOM refs ─────────────────────────────────────────────────────
+const view        = document.getElementById('view');
+const toastEl     = document.getElementById('toast');
+const userInfoEl  = document.getElementById('userInfo');
+const userRoleEl  = document.getElementById('userRoleBadge');
+const userEmailEl = document.getElementById('userEmail');
+
+const ROLE_LABEL = { director: 'Director', analyst: 'Analyst', cfo: 'CFO' };
+const STATUS = {
+  pending_analyst: { label: 'Pending Review', cls: 'st-amber' },
+  pending_cfo:     { label: 'Pending CFO',    cls: 'st-amber' },
+  approved:        { label: 'Approved',       cls: 'st-green' },
+  denied:          { label: 'Denied',         cls: 'st-red'   },
+};
+
+// ── Utils ────────────────────────────────────────────────────────
+const money       = n => (n < 0 ? '-$' : '$') + Math.abs(Math.round(n)).toLocaleString('en-US');
+const esc         = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const sortByMonth = rows => [...rows].sort((a,b) => MONTH_ORDER.indexOf(a.month) - MONTH_ORDER.indexOf(b.month));
 
 let toastTimer;
 function toast(msg, kind = 'ok') {
   toastEl.textContent = msg;
-  toastEl.className = `toast show ${kind}`;
+  toastEl.className   = `toast show ${kind}`;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (toastEl.className = 'toast'), 3200);
 }
 
-// ── Data layer ──────────────────────────────────────────────────
+function getSelectedMonths() {
+  const available = analyst.allRecords.map(r => r.month);
+  if (analyst.periodType === 'month')   return analyst.period ? [analyst.period] : [];
+  if (analyst.periodType === 'quarter') return (QUARTERS[analyst.period] || []).filter(m => available.includes(m));
+  if (analyst.periodType === 'year')    return available;
+  return [];
+}
+
+// ── Realtime ─────────────────────────────────────────────────────
+let realtimeChannel = null;
+
+function initRealtime() {
+  if (realtimeChannel) supabase.removeChannel(realtimeChannel);
+  realtimeChannel = supabase.channel('app-changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'reconciliations' }, () => {
+      fetchRecs().then(updateProgress);
+    })
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'audit_log' }, () => {
+      updateAuditTrail();
+    })
+    .subscribe();
+}
+
+// ── Auth ─────────────────────────────────────────────────────────
+async function init() {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session) await onSignIn(session.user);
+  else renderLanding();
+
+  supabase.auth.onAuthStateChange(async (event, session) => {
+    if (event === 'SIGNED_IN' && session) await onSignIn(session.user);
+    else if (event === 'SIGNED_OUT') {
+      if (realtimeChannel) { supabase.removeChannel(realtimeChannel); realtimeChannel = null; }
+      currentUser = null; currentRole = null;
+      setHeader(false); renderLanding();
+    }
+  });
+}
+
+async function onSignIn(user) {
+  currentUser = user;
+  const { data, error } = await supabase
+    .from('user_roles').select('role').eq('user_id', user.id).single();
+  if (error || !data) {
+    toast('No role assigned — contact your administrator.', 'err');
+    await supabase.auth.signOut(); return;
+  }
+  currentRole = data.role;
+  setHeader(true, user.email, currentRole);
+  fetchRecs().then(updateProgress);
+  initRealtime();
+  renderForRole();
+}
+
+function setHeader(loggedIn, email = '', role = '') {
+  const track = document.getElementById('progressTrack');
+  if (loggedIn) {
+    userRoleEl.textContent   = ROLE_LABEL[role] || role;
+    userEmailEl.textContent  = email;
+    userInfoEl.style.display = 'flex';
+    if (track) track.style.display = 'flex';
+  } else {
+    userInfoEl.style.display = 'none';
+    if (track) track.style.display = 'none';
+  }
+}
+
+function updateProgress(recs) {
+  const hasData      = recs.length > 0;
+  const hasSubmitted = recs.some(r => ['pending_cfo','approved'].includes(r.status));
+  const allApproved  = hasData && recs.every(r => r.status === 'approved');
+  const states       = [hasData, hasSubmitted, allApproved];
+
+  states.forEach((done, i) => {
+    const el = document.getElementById(`pStep${i + 1}`);
+    if (!el) return;
+    const isActive = !done && (i === 0 || states[i - 1]);
+    el.className = `progress-step${done ? ' done' : isActive ? ' active' : ''}`;
+  });
+  states.slice(0, -1).forEach((done, i) => {
+    const conn = document.getElementById(`pConn${i + 1}`);
+    if (conn) conn.className = `progress-conn${done ? ' done' : ''}`;
+  });
+}
+
+document.getElementById('homeBadge').addEventListener('click',  async () => supabase.auth.signOut());
+document.getElementById('btnSignOut').addEventListener('click', async () => supabase.auth.signOut());
+function renderForRole() {
+  if (currentRole === 'director') return renderConsultant();
+  if (currentRole === 'analyst')  return renderAnalyst();
+  if (currentRole === 'cfo')      return renderCFO();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// LANDING — Login
+// ══════════════════════════════════════════════════════════════════
+
+function renderLanding() {
+  view.innerHTML = `
+    <div class="landing">
+      <div class="landing-card">
+        <div class="landing-logo">
+          <img class="p-badge-lg" src="/logo_green.png" alt="Pioneer">
+          <h1 class="landing-title">Claude <em>Close</em></h1>
+          <p class="landing-sub">EPiC 2026 &middot; Pioneer Management Consulting</p>
+        </div>
+        <form class="login-form" id="loginForm" novalidate>
+          <div class="field-group">
+            <label class="field-lbl" for="loginEmail">Email</label>
+            <input class="field-input" type="email" id="loginEmail"
+              placeholder="you@thepioneerteam.com" required autocomplete="email">
+          </div>
+          <div class="field-group">
+            <label class="field-lbl" for="loginPw">Password</label>
+            <input class="field-input" type="password" id="loginPw"
+              placeholder="••••••••" required autocomplete="current-password">
+          </div>
+          <p class="login-err" id="loginErr"></p>
+          <button class="btn btn-primary btn-full" type="submit" id="btnLogin">Sign in</button>
+        </form>
+      </div>
+    </div>`;
+
+  document.getElementById('loginForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const email    = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPw').value;
+    const errEl    = document.getElementById('loginErr');
+    const btn      = document.getElementById('btnLogin');
+    btn.disabled = true; btn.textContent = 'Signing in…'; errEl.textContent = '';
+    await supabase.auth.signOut();
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) { errEl.textContent = error.message; btn.disabled = false; btn.textContent = 'Sign in'; }
+  });
+}
+
+// ── Data layer ───────────────────────────────────────────────────
 async function fetchRecs() {
   const { data, error } = await supabase.from('reconciliations').select('*');
   if (error) { toast(error.message, 'err'); return []; }
   return sortByMonth(data);
 }
 
-async function submitForReview(records) {
-  const rows = records.map(r => ({
-    month: r.month,
-    year: r.year,
-    pl_revenue: r.pl_revenue,
-    projects_total: r.projects_total,
-    claude_analysis: r.claude_analysis,
-    status: 'pending_analyst',
-    analyst_confirmed_at: null,
-    cfo_user_id: null,
-    cfo_decided_at: null,
-    denial_note: null,
+async function upsertRec(rec) {
+  const { error } = await supabase.from('reconciliations').upsert({
+    month: rec.month, year: rec.year,
+    pl_revenue: rec.pl_revenue, projects_total: rec.projects_total,
+    claude_analysis: rec.claude_analysis,
+    status: 'pending_cfo',
+    analyst_user_id: currentUser?.id ?? null,
+    analyst_confirmed_at: new Date().toISOString(),
+    cfo_user_id: null, cfo_decided_at: null, denial_note: null,
     updated_at: new Date().toISOString(),
-  }));
-  const { error } = await supabase
-    .from('reconciliations')
-    .upsert(rows, { onConflict: 'month,year' });
+  }, { onConflict: 'month,year' });
   if (error) { toast(error.message, 'err'); return false; }
+  await insertAuditLog('Submitted to CFO', rec.month, rec.year);
   return true;
 }
 
@@ -69,204 +223,534 @@ async function updateStatus(id, patch) {
   return true;
 }
 
-// ── Role switching ──────────────────────────────────────────────
-document.getElementById('roleSwitch').addEventListener('click', e => {
-  const btn = e.target.closest('.role-btn');
-  if (!btn) return;
-  role = btn.dataset.role;
-  document.querySelectorAll('.role-btn').forEach(b => b.classList.toggle('active', b === btn));
-  render();
-});
-
-// ── Render dispatch ─────────────────────────────────────────────
-async function render() {
-  if (role === 'consultant') return renderConsultant();
-  if (role === 'analyst')    return renderLedger('analyst');
-  if (role === 'cfo')        return renderLedger('cfo');
+async function insertAuditLog(action, month, year, details = null) {
+  const { error } = await supabase.from('audit_log').insert({
+    action, month, year: year || 2026,
+    user_email: currentUser?.email ?? null,
+    details,
+  });
+  if (error) console.error('audit_log insert failed:', error.message);
 }
 
-// ── Consultant: upload + discrepancy check + submit ─────────────
+async function fetchAuditLog() {
+  const { data } = await supabase
+    .from('audit_log').select('*')
+    .order('created_at', { ascending: false }).limit(50);
+  return data || [];
+}
+
+const AUDIT_ACTION_CLS = { 'Submitted to CFO': 'st-amber', 'Approved': 'st-green', 'Denied': 'st-red' };
+
+function auditLogRows(log) {
+  if (!log.length) return '<tr><td colspan="5" class="muted" style="text-align:center;padding:1rem;">No activity yet.</td></tr>';
+  return log.map(e => `
+    <tr>
+      <td>${new Date(e.created_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</td>
+      <td><span class="st ${AUDIT_ACTION_CLS[e.action]||''}">${esc(e.action)}</span></td>
+      <td>${esc(e.month||'—')} ${e.year||''}</td>
+      <td class="muted">${esc(e.user_email||'—')}</td>
+      <td class="muted">${esc(e.details||'')}</td>
+    </tr>`).join('');
+}
+
+async function updateAuditTrail() {
+  const tbody = document.querySelector('.audit-card tbody');
+  if (!tbody) return;
+  const log = await fetchAuditLog();
+  tbody.innerHTML = auditLogRows(log);
+}
+
+// ── CSV download ─────────────────────────────────────────────────
+function downloadCSV(recs, filename) {
+  const headers = ['Month','Year','P&L Revenue','Projects Total','Variance','% Variance','Status'];
+  const rows = recs.map(r => {
+    const v = r.projects_total - r.pl_revenue;
+    const pct = r.pl_revenue ? (v / Math.abs(r.pl_revenue)) * 100 : 0;
+    return [r.month, r.year || 2026, r.pl_revenue, r.projects_total, v, pct.toFixed(1) + '%', r.status]
+      .map(val => `"${String(val).replace(/"/g,'""')}"`).join(',');
+  });
+  const csv  = [headers.join(','), ...rows].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// DIRECTOR — Invoice generator
+// ══════════════════════════════════════════════════════════════════
+
 async function renderConsultant() {
-  const recs = await fetchRecs();
   view.innerHTML = `
     <section class="card">
-      <h1>Upload close files</h1>
-      <p class="sub">Provide the firm P&amp;L and the revenue-by-client/project export. Claude reconciles project revenue against the P&amp;L and flags discrepancies for the client's financial analyst.</p>
-      <div class="drops">
-        ${dropHTML('pl', 'P&L (financial actuals)', upload.plRows)}
-        ${dropHTML('proj', 'Projects by company', upload.projRows)}
+      <h1>Generate invoice</h1>
+      <p class="sub">Upload the projects file, then select a client and billing month to preview and send the invoice.</p>
+      <div class="source-row">
+        <label class="drop ${consultant.projRows ? 'loaded' : ''}" id="drop-cproj">
+          <input type="file" id="file-cproj" accept=".csv,.xlsx,.xls" hidden>
+          <div class="drop-icon">${consultant.projRows ? '✓' : '📄'}</div>
+          <strong>Projects / Revenue file</strong>
+          <span>${consultant.projRows ? 'Loaded — click to replace' : 'Click or drop CSV / XLSX'}</span>
+        </label>
+        <button class="btn fabric-btn" id="btnFabric">
+          <span class="fabric-icon">⬡</span> Load from Fabric
+        </button>
       </div>
-      <div id="previewWrap"></div>
-    </section>
-    ${recs.length ? `<section class="card"><h2>Workflow status</h2>${ledgerTable(recs, 'consultant')}</section>` : ''}
-  `;
-  wireDrop('pl', 'plRows');
-  wireDrop('proj', 'projRows');
-  renderPreview();
-}
+      <div id="invoiceWrap"></div>
+    </section>`;
 
-function dropHTML(id, label, loaded) {
-  return `
-    <label class="drop ${loaded ? 'loaded' : ''}" id="drop-${id}">
-      <input type="file" id="file-${id}" accept=".csv,.xlsx,.xls" hidden>
-      <div class="drop-icon">${loaded ? '✓' : '📄'}</div>
-      <strong>${label}</strong>
-      <span>${loaded ? 'Loaded — click to replace' : 'Click or drop CSV / XLSX'}</span>
-    </label>`;
-}
-
-function wireDrop(id, key) {
-  const drop = document.getElementById(`drop-${id}`);
-  const input = document.getElementById(`file-${id}`);
-  input.addEventListener('change', e => e.target.files[0] && loadFile(e.target.files[0], key));
-  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
-  drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+  const drop  = document.getElementById('drop-cproj');
+  const input = document.getElementById('file-cproj');
+  input.addEventListener('change', e => e.target.files[0] && loadConsultantFile(e.target.files[0]));
+  drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('drag'); });
+  drop.addEventListener('dragleave', ()  => drop.classList.remove('drag'));
   drop.addEventListener('drop', e => {
     e.preventDefault(); drop.classList.remove('drag');
-    if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0], key);
+    if (e.dataTransfer.files[0]) loadConsultantFile(e.dataTransfer.files[0]);
   });
+  document.getElementById('btnFabric').addEventListener('click', () =>
+    toast('Fabric connection is managed by the DA Team — contact them to enable live data.', 'err')
+  );
+  if (consultant.projRows) renderInvoiceSelectors();
 }
 
-async function loadFile(file, key) {
-  try {
-    upload[key] = await fileToRows(file);
-  } catch (err) {
-    toast(`Could not read ${file.name}: ${err.message}`, 'err');
-    return;
-  }
-  upload.preview = [];
+async function loadConsultantFile(file) {
+  try { consultant.projRows = await fileToRows(file); }
+  catch (err) { toast(`Could not read ${file.name}: ${err.message}`, 'err'); return; }
+  consultant.selectedCompany = null; consultant.selectedMonth = null;
   renderConsultant();
 }
 
-async function renderPreview() {
-  const wrap = document.getElementById('previewWrap');
+function renderInvoiceSelectors() {
+  const wrap = document.getElementById('invoiceWrap');
   if (!wrap) return;
-  if (!upload.plRows || !upload.projRows) {
-    wrap.innerHTML = '<p class="hint">Upload both files to run the discrepancy check.</p>';
-    return;
-  }
+  const companies = extractCompanies(consultant.projRows);
+  if (!companies.length) { wrap.innerHTML = '<p class="hint err-text">No companies found in file.</p>'; return; }
+  if (!consultant.selectedCompany || !companies.includes(consultant.selectedCompany))
+    consultant.selectedCompany = companies[0];
+  const months = extractMonthsForCompany(consultant.projRows, consultant.selectedCompany);
+  if (!consultant.selectedMonth || !months.includes(consultant.selectedMonth))
+    consultant.selectedMonth = months[0] || null;
 
-  const records = buildReconciliations(
-    extractPLRevenue(upload.plRows),
-    extractProjectTotals(upload.projRows),
-  );
-  if (!records.length) {
-    wrap.innerHTML = '<p class="hint err-text">No overlapping months found. Check that both files use month names and the P&amp;L has a "Revenue" line.</p>';
-    return;
-  }
-
-  wrap.innerHTML = `<p class="hint">Running Claude discrepancy check…</p>`;
-  const analyses = await Promise.all(records.map(analyzeReconciliation));
-  records.forEach((r, i) => (r.claude_analysis = analyses[i]));
-  upload.preview = records;
+  const coOpts = companies.map(c => `<option value="${esc(c)}" ${c === consultant.selectedCompany ? 'selected' : ''}>${esc(c)}</option>`).join('');
+  const moOpts = months.length
+    ? months.map(m => `<option value="${esc(m)}" ${m === consultant.selectedMonth ? 'selected' : ''}>${esc(m)}</option>`).join('')
+    : '<option>—</option>';
 
   wrap.innerHTML = `
-    <h2>Discrepancy check</h2>
-    ${ledgerTable(records.map(r => ({ ...r, status: 'preview' })), 'preview')}
-    <div class="actions-row">
-      <button class="btn btn-primary" id="btnSubmit">Submit ${records.length} month(s) for analyst review</button>
+    <div class="selector-row">
+      <div class="select-group">
+        <label class="sel-lbl" for="selCo">Client</label>
+        <select class="sel" id="selCo">${coOpts}</select>
+      </div>
+      <div class="select-group">
+        <label class="sel-lbl" for="selMo">Month</label>
+        <select class="sel" id="selMo"${!months.length ? ' disabled' : ''}>${moOpts}</select>
+      </div>
+    </div>
+    <div id="invoiceCard"></div>`;
+
+  document.getElementById('selCo').addEventListener('change', e => {
+    consultant.selectedCompany = e.target.value; consultant.selectedMonth = null;
+    renderInvoiceSelectors();
+  });
+  document.getElementById('selMo').addEventListener('change', e => {
+    consultant.selectedMonth = e.target.value;
+    renderInvoiceCard();
+  });
+
+  if (consultant.selectedMonth) renderInvoiceCard();
+}
+
+function renderInvoiceCard() {
+  const { selectedCompany: co, selectedMonth: mo, projRows } = consultant;
+  const card = document.getElementById('invoiceCard');
+  if (!card || !co || !mo) return;
+
+  const projects = extractProjectsForCompany(projRows, co, mo);
+  if (!projects.length) {
+    card.innerHTML = '<p class="hint">No projects found for this selection.</p>';
+    return;
+  }
+
+  const total       = projects.reduce((s, p) => s + p.revenue, 0);
+  const projectRows = projects.map(p => `<tr><td>${esc(p.project)}</td><td class="num">${money(p.revenue)}</td></tr>`).join('');
+
+  card.innerHTML = `
+    <div class="invoice-card">
+      <div class="invoice-hdr">
+        <div><div class="invoice-title">${esc(co)}</div><div class="invoice-period">${esc(mo)} 2026</div></div>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="btn" id="btnDownloadPDF">Download PDF</button>
+          <button class="btn btn-primary" id="btnSendInvoice">Send Invoice</button>
+        </div>
+      </div>
+      <div class="tscroll">
+        <table class="ledger">
+          <thead><tr><th>Project</th><th class="num">Revenue</th></tr></thead>
+          <tbody>${projectRows}</tbody>
+          <tfoot><tr class="total-row"><td><strong>Total</strong></td><td class="num"><strong>${money(total)}</strong></td></tr></tfoot>
+        </table>
+      </div>
     </div>`;
-  document.getElementById('btnSubmit').addEventListener('click', async e => {
-    e.target.disabled = true;
-    const ok = await submitForReview(upload.preview);
-    if (ok) {
-      toast('Submitted for analyst review.');
-      upload.plRows = upload.projRows = null; upload.preview = [];
-      renderConsultant();
-    } else e.target.disabled = false;
+
+  document.getElementById('btnDownloadPDF').addEventListener('click', () => {
+    downloadInvoicePDF(co, mo, projects);
+  });
+
+  document.getElementById('btnSendInvoice').addEventListener('click', () => {
+    downloadInvoicePDF(co, mo, projects);
+    const subject = encodeURIComponent(`Invoice: ${co} — ${mo} 2026`);
+    const body    = encodeURIComponent(`Please find the invoice for ${co}, ${mo} 2026 attached.\n\nThe PDF has been saved to your downloads — please attach it before sending.\n\nGenerated by Claude Close.`);
+    window.location.href = `mailto:?subject=${subject}&body=${body}`;
   });
 }
 
-// ── Analyst / CFO ledger ────────────────────────────────────────
-async function renderLedger(forRole) {
-  const recs = await fetchRecs();
-  const intro = forRole === 'analyst'
-    ? { h: 'Analyst approvals', s: 'Review Claude\'s reconciliation and confirm each month before it advances to the CFO.' }
-    : { h: 'CFO sign-off', s: 'Approve or deny each reconciliation confirmed by the financial analyst.' };
+// ══════════════════════════════════════════════════════════════════
+// ANALYST — P&L reconciliation with period selector
+// ══════════════════════════════════════════════════════════════════
+
+async function renderAnalyst() {
+  if (analyst.plRows && analyst.projRows && !analyst.allRecords.length) {
+    analyst.allRecords = buildReconciliations(
+      extractPLRevenue(analyst.plRows),
+      extractProjectTotals(analyst.projRows),
+    );
+    if (analyst.allRecords.length && !analyst.period)
+      analyst.period = analyst.allRecords[0].month;
+  }
+
+  const available  = analyst.allRecords.map(r => r.month);
+  const hasFiles   = analyst.plRows && analyst.projRows;
+  const hasData    = hasFiles && available.length > 0;
+
+  // Build period selector HTML
+  let periodHTML = '';
+  if (!hasFiles) {
+    periodHTML = '<p class="hint">Upload both files to run the discrepancy check.</p>';
+  } else if (!hasData) {
+    periodHTML = '<p class="hint err-text">No overlapping months found. Check file formats.</p>';
+  } else {
+    // Validate current period selection
+    if (analyst.periodType === 'month' && (!analyst.period || !available.includes(analyst.period)))
+      analyst.period = available[0];
+    if (analyst.periodType === 'quarter') {
+      const qs = Object.keys(QUARTERS).filter(q => QUARTERS[q].some(m => available.includes(m)));
+      if (!analyst.period || !qs.includes(analyst.period)) analyst.period = qs[0];
+    }
+    if (analyst.periodType === 'year') analyst.period = '2026';
+
+    let periodDropdown = '';
+    if (analyst.periodType === 'month') {
+      const opts = available.map(m => `<option value="${esc(m)}" ${m === analyst.period ? 'selected':''}>${esc(m)} 2026</option>`).join('');
+      periodDropdown = `<div class="select-group"><select class="sel" id="selPeriod">${opts}</select></div>`;
+    } else if (analyst.periodType === 'quarter') {
+      const qs   = Object.keys(QUARTERS).filter(q => QUARTERS[q].some(m => available.includes(m)));
+      const opts = qs.map(q => `<option value="${q}" ${q === analyst.period ? 'selected':''}>${q} 2026</option>`).join('');
+      periodDropdown = `<div class="select-group"><select class="sel" id="selPeriod">${opts}</select></div>`;
+    }
+
+    periodHTML = `
+      <div class="period-row">
+        <div class="period-type-group">
+          <button class="period-btn ${analyst.periodType==='month'   ? 'active':''}" data-type="month">Month</button>
+          <button class="period-btn ${analyst.periodType==='quarter' ? 'active':''}" data-type="quarter">Quarter</button>
+          <button class="period-btn ${analyst.periodType==='year'    ? 'active':''}" data-type="year">Year</button>
+        </div>
+        ${periodDropdown}
+      </div>
+      <div id="periodAnalysis"></div>`;
+  }
+
   view.innerHTML = `
     <section class="card">
-      <h1>${intro.h}</h1>
-      <p class="sub">${intro.s}</p>
-      ${recs.length ? ledgerTable(recs, forRole) : '<p class="hint">Nothing submitted yet.</p>'}
+      <h1>P&L reconciliation</h1>
+      <p class="sub">Select a reporting period to verify whether the P&L revenue matches the sum of client project revenues.</p>
+      <div class="drops">
+        ${dropHTML('pl',   'P&L (financial actuals)', analyst.plRows)}
+        ${dropHTML('proj', 'Projects by company',     analyst.projRows)}
+      </div>
+      ${periodHTML}
     </section>`;
-  wireLedgerActions(forRole);
+
+  wireAnalystDrop('pl',   'plRows');
+  wireAnalystDrop('proj', 'projRows');
+
+  view.querySelectorAll('.period-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      analyst.periodType = btn.dataset.type;
+      analyst.period     = null;
+      renderAnalyst();
+    });
+  });
+
+  document.getElementById('selPeriod')?.addEventListener('change', e => {
+    analyst.period = e.target.value;
+    document.getElementById('periodAnalysis').innerHTML = '<p class="hint">Running Claude discrepancy check…</p>';
+    renderPeriodAnalysis();
+  });
+
+  if (hasData && analyst.period) renderPeriodAnalysis();
 }
 
-function ledgerTable(recs, forRole) {
-  const rows = sortByMonth(recs).map(r => {
-    const variance = r.projects_total - r.pl_revenue;
-    const pct = r.pl_revenue ? (variance / Math.abs(r.pl_revenue)) * 100 : 0;
-    const material = Math.abs(pct) >= THRESHOLD;
-    const st = STATUS[r.status];
-    const badge = forRole === 'preview'
-      ? `<span class="pill ${material ? 'pill-bad' : 'pill-ok'}">${material ? 'Discrepancy' : 'Ties out'}</span>`
-      : `<span class="st ${st?.cls || ''}">${st?.label || r.status}</span>`;
+async function renderPeriodAnalysis() {
+  const wrap = document.getElementById('periodAnalysis');
+  if (!wrap) return;
 
+  const selectedMonths = getSelectedMonths();
+  if (!selectedMonths.length) { wrap.innerHTML = '<p class="hint">No data for this period.</p>'; return; }
+
+  // Run Claude for uncached months
+  const uncached = selectedMonths.filter(m => !analyst.analyzedMonths[m]);
+  if (uncached.length) {
+    wrap.innerHTML = '<p class="hint">Running Claude discrepancy check…</p>';
+    const results = await Promise.all(uncached.map(m =>
+      analyzeReconciliation(analyst.allRecords.find(r => r.month === m))
+    ));
+    uncached.forEach((m, i) => { analyst.analyzedMonths[m] = results[i]; });
+  }
+
+  const recs = selectedMonths.map(m => ({
+    ...analyst.allRecords.find(r => r.month === m),
+    claude_analysis: analyst.analyzedMonths[m],
+  }));
+
+  const existing = await fetchRecs();
+  updateProgress(existing);
+  const byMonth  = Object.fromEntries(existing.map(r => [r.month, r]));
+  const merged   = recs.map(r => ({
+    ...r,
+    id:          byMonth[r.month]?.id          ?? null,
+    status:      byMonth[r.month]?.status      ?? 'new',
+    denial_note: byMonth[r.month]?.denial_note ?? null,
+  }));
+
+  // Table rows
+  const rows = merged.map(r => {
+    const v   = r.projects_total - r.pl_revenue;
+    const pct = r.pl_revenue ? (v / Math.abs(r.pl_revenue)) * 100 : 0;
+    const mat = Math.abs(pct) >= THRESHOLD;
+    const st  = STATUS[r.status];
+    const badge = st
+      ? `<span class="st ${st.cls}">${st.label}</span>`
+      : `<span class="pill ${mat ? 'pill-bad':'pill-ok'}">${mat ? 'Discrepancy':'Ties out'}</span>`;
     return `
       <tr>
-        <td>${esc(r.month)} ${r.year || ''}</td>
+        <td>${esc(r.month)} 2026</td>
         <td class="num">${money(r.pl_revenue)}</td>
         <td class="num">${money(r.projects_total)}</td>
-        <td class="num ${material ? 'bad' : ''}">${variance >= 0 ? '+' : ''}${money(variance)}</td>
-        <td class="num"><span class="pct ${material ? 'pill-bad' : 'pill-ok'}">${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%</span></td>
+        <td class="num ${mat ? 'bad':''}">${v>=0?'+':''}${money(v)}</td>
+        <td class="num"><span class="pct ${mat?'pill-bad':'pill-ok'}">${pct>=0?'+':''}${pct.toFixed(1)}%</span></td>
         <td>${badge}</td>
-        ${forRole === 'analyst' || forRole === 'cfo'
-          ? `<td class="act">${actionButtons(r, forRole)}</td>` : ''}
       </tr>
       <tr class="analysis-row">
-        <td colspan="${forRole === 'analyst' || forRole === 'cfo' ? 7 : 6}">
-          <span class="ai-tag">Claude</span> ${esc(r.claude_analysis) || '—'}
+        <td colspan="6"><span class="ai-tag">Claude</span> ${esc(r.claude_analysis)}
           ${r.denial_note ? `<div class="deny-note">Denied: ${esc(r.denial_note)}</div>` : ''}
         </td>
       </tr>`;
   }).join('');
 
-  const actCol = (forRole === 'analyst' || forRole === 'cfo') ? '<th>Action</th>' : '';
+  // Summary row for multi-month periods
+  let summaryHTML = '';
+  if (merged.length > 1) {
+    const tPL   = merged.reduce((s,r) => s + r.pl_revenue, 0);
+    const tProj = merged.reduce((s,r) => s + r.projects_total, 0);
+    const tV    = tProj - tPL;
+    const tPct  = tPL ? (tV / Math.abs(tPL)) * 100 : 0;
+    const tMat  = Math.abs(tPct) >= THRESHOLD;
+    summaryHTML = `
+      <tr class="total-row">
+        <td><strong>Period Total</strong></td>
+        <td class="num"><strong>${money(tPL)}</strong></td>
+        <td class="num"><strong>${money(tProj)}</strong></td>
+        <td class="num ${tMat?'bad':''}"><strong>${tV>=0?'+':''}${money(tV)}</strong></td>
+        <td class="num"><strong><span class="pct ${tMat?'pill-bad':'pill-ok'}">${tPct>=0?'+':''}${tPct.toFixed(1)}%</span></strong></td>
+        <td></td>
+      </tr>`;
+  }
+
+  const canSubmit = merged.filter(r => ['new','pending_analyst','denied'].includes(r.status));
+  const canReset  = merged.filter(r => r.status === 'approved');
+
+  wrap.innerHTML = `
+    <div class="tscroll" style="margin-top:1rem;">
+      <table class="ledger">
+        <thead><tr>
+          <th>Month</th><th class="num">P&amp;L Revenue</th><th class="num">Projects Total</th>
+          <th class="num">Variance</th><th class="num">%</th><th>Status</th>
+        </tr></thead>
+        <tbody>${rows}${summaryHTML}</tbody>
+      </table>
+    </div>
+    <div class="actions-row">
+      ${canSubmit.length ? `<button class="btn btn-primary" id="btnSubmitPeriod">Submit ${canSubmit.length} month${canSubmit.length!==1?'s':''} to CFO</button>` : ''}
+      ${canReset.length  ? `<button class="btn btn-deny" id="btnResetPeriod">Reset ${canReset.length} approval${canReset.length!==1?'s':''}</button>` : ''}
+    </div>`;
+
+  document.getElementById('btnSubmitPeriod')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btnSubmitPeriod');
+    btn.disabled = true;
+    await Promise.all(canSubmit.map(r => upsertRec(r)));
+    toast(`${canSubmit.length} month${canSubmit.length!==1?'s':''} submitted for CFO review.`);
+    renderPeriodAnalysis();
+  });
+
+  document.getElementById('btnResetPeriod')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btnResetPeriod');
+    btn.disabled = true;
+    await Promise.all(canReset.map(r =>
+      updateStatus(r.id, { status:'pending_analyst', cfo_user_id:null, cfo_decided_at:null, denial_note:null })
+    ));
+    toast('Approvals reset.');
+    renderPeriodAnalysis();
+  });
+}
+
+function dropHTML(id, label, loaded) {
+  return `
+    <label class="drop ${loaded?'loaded':''}" id="drop-${id}">
+      <input type="file" id="file-${id}" accept=".csv,.xlsx,.xls" hidden>
+      <div class="drop-icon">${loaded?'✓':'📄'}</div>
+      <strong>${label}</strong>
+      <span>${loaded?'Loaded — click to replace':'Click or drop CSV / XLSX'}</span>
+    </label>`;
+}
+
+function wireAnalystDrop(id, key) {
+  const drop  = document.getElementById(`drop-${id}`);
+  const input = document.getElementById(`file-${id}`);
+  input.addEventListener('change', e => e.target.files[0] && loadAnalystFile(e.target.files[0], key));
+  drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('drag'); });
+  drop.addEventListener('dragleave', ()  => drop.classList.remove('drag'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault(); drop.classList.remove('drag');
+    if (e.dataTransfer.files[0]) loadAnalystFile(e.dataTransfer.files[0], key);
+  });
+}
+
+async function loadAnalystFile(file, key) {
+  try { analyst[key] = await fileToRows(file); }
+  catch (err) { toast(`Could not read ${file.name}: ${err.message}`, 'err'); return; }
+  analyst.allRecords = []; analyst.analyzedMonths = {};
+  analyst.periodType = 'month'; analyst.period = null;
+  renderAnalyst();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// CFO — Sign-off (pending queue only + download approved)
+// ══════════════════════════════════════════════════════════════════
+
+async function renderCFO() {
+  const [allRecs, log] = await Promise.all([fetchRecs(), fetchAuditLog()]);
+  updateProgress(allRecs);
+  const pendingRecs    = allRecs.filter(r => r.status === 'pending_cfo');
+  const approvedRecs   = sortByMonth(allRecs.filter(r => r.status === 'approved'));
+
+  const logRows = auditLogRows(log);
+
+  view.innerHTML = `
+    <section class="card">
+      <h1>CFO sign-off</h1>
+      <p class="sub">Review pending reconciliations. Deny individual months or approve all at once.</p>
+      ${pendingRecs.length ? cfoTable(pendingRecs) : '<p class="hint">No months pending review.</p>'}
+      <div class="actions-row" style="gap:0.75rem;">
+        ${pendingRecs.length ? `
+          <button class="btn btn-primary" id="btnApproveAll">
+            Approve all (${pendingRecs.length} month${pendingRecs.length!==1?'s':''})
+          </button>` : ''}
+        ${approvedRecs.length ? `
+          <button class="btn" id="btnDownload">
+            Download approved (${approvedRecs.length} month${approvedRecs.length!==1?'s':''})
+          </button>` : ''}
+      </div>
+    </section>
+    <section class="card audit-card">
+      <h2 class="audit-hdr">Audit trail</h2>
+      <div class="tscroll">
+        <table class="ledger">
+          <thead><tr><th>Time</th><th>Action</th><th>Month</th><th>By</th><th>Notes</th></tr></thead>
+          <tbody>${logRows}</tbody>
+        </table>
+      </div>
+    </section>`;
+
+  wireCFOActions(pendingRecs, approvedRecs);
+}
+
+function wireCFOActions(pendingRecs, approvedRecs) {
+  view.querySelectorAll('button[data-act="deny"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const note = prompt('Reason for denial:');
+      if (note === null) return;
+      btn.disabled = true;
+      const ok = await updateStatus(btn.dataset.id, {
+        status:'denied', cfo_user_id: currentUser?.id ?? null,
+        cfo_decided_at: new Date().toISOString(), denial_note: note,
+      });
+      if (ok) {
+        await insertAuditLog('Denied', btn.dataset.month, parseInt(btn.dataset.year), note || null);
+        toast('Denied.', 'err'); renderCFO();
+      } else btn.disabled = false;
+    });
+  });
+
+  document.getElementById('btnApproveAll')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btnApproveAll');
+    btn.disabled = true; btn.textContent = 'Approving…';
+    await Promise.all(pendingRecs.map(r => Promise.all([
+      updateStatus(r.id, {
+        status:'approved', cfo_user_id: currentUser?.id ?? null,
+        cfo_decided_at: new Date().toISOString(),
+      }),
+      insertAuditLog('Approved', r.month, r.year),
+    ])));
+    toast(`${pendingRecs.length} month${pendingRecs.length!==1?'s':''} approved.`);
+    renderCFO();
+  });
+
+  document.getElementById('btnDownload')?.addEventListener('click', () => {
+    downloadCSV(approvedRecs, `reconciliation-approved-${new Date().toISOString().slice(0,10)}.csv`);
+  });
+}
+
+function cfoTable(recs) {
+  const rows = recs.map(r => {
+    const v   = r.projects_total - r.pl_revenue;
+    const pct = r.pl_revenue ? (v / Math.abs(r.pl_revenue)) * 100 : 0;
+    const mat = Math.abs(pct) >= THRESHOLD;
+    const st  = STATUS[r.status];
+    const badge  = st ? `<span class="st ${st.cls}">${st.label}</span>` : '—';
+    const action = r.status === 'pending_cfo'
+      ? `<button class="btn btn-sm btn-deny" data-act="deny" data-id="${r.id}" data-month="${esc(r.month)}" data-year="${r.year||2026}">Deny</button>`
+      : '<span class="muted">—</span>';
+    return `
+      <tr>
+        <td>${esc(r.month)} ${r.year||2026}</td>
+        <td class="num">${money(r.pl_revenue)}</td>
+        <td class="num">${money(r.projects_total)}</td>
+        <td class="num ${mat?'bad':''}">${v>=0?'+':''}${money(v)}</td>
+        <td class="num"><span class="pct ${mat?'pill-bad':'pill-ok'}">${pct>=0?'+':''}${pct.toFixed(1)}%</span></td>
+        <td>${badge}</td>
+        <td class="act">${action}</td>
+      </tr>
+      <tr class="analysis-row">
+        <td colspan="7"><span class="ai-tag">Claude</span> ${esc(r.claude_analysis)||'—'}
+          ${r.denial_note?`<div class="deny-note">Denied: ${esc(r.denial_note)}</div>`:''}
+        </td>
+      </tr>`;
+  }).join('');
+
   return `
     <div class="tscroll">
       <table class="ledger">
         <thead><tr>
-          <th>Month</th><th class="num">P&amp;L revenue</th><th class="num">Projects total</th>
-          <th class="num">Variance</th><th class="num">%</th><th>Status</th>${actCol}
+          <th>Month</th><th class="num">P&amp;L Revenue</th><th class="num">Projects Total</th>
+          <th class="num">Variance</th><th class="num">%</th><th>Status</th><th>Action</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
 }
 
-function actionButtons(r, forRole) {
-  if (forRole === 'analyst') {
-    if (r.status === 'pending_analyst') return `<button class="btn btn-sm btn-primary" data-act="confirm" data-id="${r.id}">Confirm</button>`;
-    if (r.status === 'denied') return `<button class="btn btn-sm btn-primary" data-act="confirm" data-id="${r.id}">Re-submit</button>`;
-    return '<span class="muted">—</span>';
-  }
-  // cfo
-  return r.status === 'pending_cfo'
-    ? `<button class="btn btn-sm btn-primary" data-act="approve" data-id="${r.id}">Approve</button>
-       <button class="btn btn-sm btn-deny" data-act="deny" data-id="${r.id}">Deny</button>`
-    : '<span class="muted">—</span>';
-}
-
-function wireLedgerActions(forRole) {
-  view.querySelectorAll('button[data-act]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const id = btn.dataset.id;
-      let ok = false;
-      if (btn.dataset.act === 'confirm') {
-        ok = await updateStatus(id, { status: 'pending_cfo', analyst_confirmed_at: new Date().toISOString(), denial_note: null, cfo_decided_at: null });
-        if (ok) toast('Confirmed — sent to CFO.');
-      } else if (btn.dataset.act === 'approve') {
-        ok = await updateStatus(id, { status: 'approved', cfo_decided_at: new Date().toISOString() });
-        if (ok) toast('Approved.');
-      } else if (btn.dataset.act === 'deny') {
-        const note = prompt('Reason for denial (returned to analyst):');
-        if (note === null) return;
-        ok = await updateStatus(id, { status: 'denied', cfo_decided_at: new Date().toISOString(), denial_note: note });
-        if (ok) toast('Denied.', 'err');
-      }
-      if (ok) renderLedger(forRole);
-    });
-  });
-}
-
-render();
+init();

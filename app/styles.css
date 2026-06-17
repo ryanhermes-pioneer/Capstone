@@ -24,9 +24,7 @@ header {
   padding: 0.85rem 1.5rem; background: var(--dark); color: #fff;
 }
 .p-badge {
-  width: 30px; height: 30px; border-radius: 7px;
-  background: var(--green); color: #fff; font-weight: 700;
-  display: grid; place-items: center; font-size: 0.95rem;
+  width: 30px; height: 30px; object-fit: contain;
 }
 .brand-name { font-size: 1.05rem; font-weight: 600; }
 .brand-name em { color: var(--green); font-style: normal; }
@@ -85,7 +83,7 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
 
 /* ── Pills / status ── */
 .pct, .pill { display: inline-block; padding: 0.12rem 0.5rem; border-radius: 999px; font-size: 0.74rem; font-weight: 600; }
-.pill-ok { background: #e6f0ea; color: var(--green); }
+.pill-ok  { background: #e6f0ea; color: var(--green); }
 .pill-bad { background: #f6e3e1; color: var(--red); }
 .st { display: inline-block; padding: 0.18rem 0.6rem; border-radius: 6px; font-size: 0.74rem; font-weight: 600; }
 .st-amber { background: #f7ecd8; color: var(--amber); }
@@ -114,3 +112,136 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
 .toast.err { background: var(--red); }
 
 @media (max-width: 640px) { .drops { grid-template-columns: 1fr; } }
+
+/* ── Header: user info (post-login) ── */
+.p-badge { cursor: pointer; }
+.user-info { display: none; align-items: center; gap: 0.6rem; }
+.user-role {
+  font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  background: rgba(255,255,255,0.15); color: #fff;
+  padding: 0.2rem 0.55rem; border-radius: 5px;
+}
+.user-email { font-size: 0.82rem; color: var(--gray4); }
+.btn-signout {
+  border: 1px solid rgba(255,255,255,0.2); background: transparent; color: #cfcac3;
+  padding: 0.3rem 0.7rem; border-radius: 6px; font-size: 0.78rem; cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-signout:hover { background: rgba(255,255,255,0.1); color: #fff; }
+
+/* ── Landing page ── */
+.landing {
+  min-height: calc(100vh - 58px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 2rem 1rem;
+}
+.landing-card {
+  width: 100%; max-width: 420px;
+  background: #fff; border: 1px solid var(--line); border-radius: 16px;
+  padding: 2.5rem 2rem; display: flex; flex-direction: column; gap: 2rem;
+}
+.landing-logo { text-align: center; display: flex; flex-direction: column; align-items: center; gap: 0.75rem; }
+.p-badge-lg {
+  width: 52px; height: 52px; object-fit: contain;
+}
+.landing-title { font-size: 1.5rem; font-weight: 700; margin: 0; }
+.landing-title em { color: var(--green); font-style: normal; }
+.landing-sub { font-size: 0.82rem; color: var(--gray4); margin: 0; }
+
+/* ── Login form ── */
+.login-form { display: flex; flex-direction: column; gap: 1rem; }
+.field-group { display: flex; flex-direction: column; gap: 0.3rem; }
+.field-lbl { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--gray4); }
+.field-input {
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 0.6rem 0.75rem; font-size: 0.9rem;
+  color: var(--dark); background: #fff; width: 100%;
+  transition: border-color 0.15s;
+}
+.field-input:focus { outline: none; border-color: var(--green); }
+.login-err { font-size: 0.82rem; color: var(--red); min-height: 1.1rem; margin: 0; }
+.btn-full { width: 100%; padding: 0.65rem; font-size: 0.9rem; justify-content: center; }
+
+/* ── Consultant: source row (file drop + Fabric) ── */
+.source-row { display: flex; gap: 1rem; margin-top: 1.2rem; align-items: stretch; }
+.source-row .drop { flex: 1; }
+.fabric-btn {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0.4rem; padding: 1.5rem 1.5rem;
+  border: 1.5px dashed var(--beige); border-radius: 10px;
+  background: var(--off); cursor: pointer; color: var(--gray6);
+  font-size: 0.88rem; min-width: 160px; transition: all 0.15s;
+}
+.fabric-btn:hover { border-color: var(--green); background: #fff; color: var(--dark); }
+.fabric-icon { font-size: 1.4rem; line-height: 1; }
+
+/* ── Period type selector (analyst) ── */
+.period-row { display: flex; align-items: flex-end; gap: 1rem; margin-top: 1.4rem; flex-wrap: wrap; }
+.period-type-group {
+  display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+}
+.period-btn {
+  border: none; border-right: 1px solid var(--line); background: #fff; color: var(--gray6);
+  padding: 0.5rem 1.1rem; font-size: 0.84rem; cursor: pointer; transition: all 0.15s;
+}
+.period-btn:last-child { border-right: none; }
+.period-btn:hover { background: var(--off); }
+.period-btn.active { background: var(--dark); color: #fff; font-weight: 600; }
+
+/* ── Selectors (company / month dropdowns) ── */
+.selector-row { display: flex; align-items: flex-end; gap: 1rem; margin-top: 1.4rem; flex-wrap: wrap; }
+.select-group { display: flex; flex-direction: column; gap: 0.3rem; }
+.sel-lbl { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--gray4); font-weight: 600; }
+.sel {
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 0.5rem 0.75rem; font-size: 0.86rem;
+  background: #fff; color: var(--dark); min-width: 200px; cursor: pointer;
+}
+.sel:focus { outline: none; border-color: var(--green); }
+
+/* ── Progress bar ── */
+.progress-track {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+  padding: 0.85rem 2rem;
+}
+.progress-step {
+  display: flex; flex-direction: column; align-items: center; gap: 0.3rem;
+  min-width: 110px;
+}
+.progress-step span { font-size: 0.72rem; color: var(--gray4); white-space: nowrap; }
+.step-dot {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 2px solid var(--line); background: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.72rem; font-weight: 700; color: transparent;
+  transition: all 0.2s;
+}
+.progress-conn {
+  flex: 1; height: 2px; background: var(--line);
+  margin-bottom: 18px; transition: background 0.2s;
+}
+.progress-step.done .step-dot  { background: var(--green); border-color: var(--green); color: #fff; }
+.progress-step.done .step-dot::after { content: '✓'; }
+.progress-step.done span       { color: var(--green); font-weight: 600; }
+.progress-step.active .step-dot { border-color: var(--green); box-shadow: 0 0 0 3px rgba(87,161,119,0.18); }
+.progress-step.active span      { color: var(--dark); font-weight: 600; }
+.progress-conn.done { background: var(--green); }
+
+/* ── Audit trail ── */
+.audit-card { margin-top: 0; }
+.audit-hdr { font-size: 0.85rem; font-weight: 600; color: var(--gray4); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.75rem; }
+
+/* ── Invoice card ── */
+.invoice-card { margin-top: 1.5rem; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.invoice-hdr {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 1rem 1.25rem; background: var(--off); border-bottom: 1px solid var(--line);
+}
+.invoice-title  { font-size: 1rem; font-weight: 700; }
+.invoice-period { font-size: 0.82rem; color: var(--gray6); margin-top: 0.1rem; }
+.invoice-card .tscroll { padding: 0; }
+.total-row td { border-top: 2px solid var(--line); padding-top: 0.7rem; }
