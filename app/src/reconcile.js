@@ -82,6 +82,28 @@ export function extractProjectTotals(rows) {
   return out;
 }
 
+// ── Projects → per-client line items for one month ──────────────
+export function extractProjectLineItems(rows, month) {
+  if (rows.length < 2) return [];
+  const headers   = rows[0];
+  const monthCol  = Math.max(0, findCol(headers, 'month', 'period'));
+  const clientCol = Math.max(0, findCol(headers, 'client', 'company', 'customer'));
+  let valueCol    = findCol(headers, 'revenue', 'amount', 'sum');
+  if (valueCol < 0) valueCol = rows[0].length - 1;
+
+  const byClient = {};
+  for (const r of rows.slice(1)) {
+    const m = monthName(r[monthCol]);
+    if (m !== month) continue;
+    const client = String(r[clientCol]).trim();
+    if (!client) continue;
+    byClient[client] = (byClient[client] || 0) + num(r[valueCol]);
+  }
+  return Object.entries(byClient)
+    .map(([client, amount]) => ({ client, amount }))
+    .sort((a, b) => b.amount - a.amount);
+}
+
 // ── Build reconciliation records ────────────────────────────────
 export function buildReconciliations(plRevenue, projectTotals) {
   const months = [...new Set([...Object.keys(plRevenue), ...Object.keys(projectTotals)])]
@@ -105,44 +127,46 @@ const anthropic = new Anthropic({
 
 const THRESHOLD = 1;
 
-export async function analyzeReconciliation(rec) {
+export async function analyzeReconciliation(rec, lineItems = []) {
   const { month, pl_revenue, projects_total, variance, pct } = rec;
-  if (!import.meta.env.VITE_CLAUDE_API_KEY) return fallbackAnalysis(rec);
+  if (!import.meta.env.VITE_CLAUDE_API_KEY) return fallbackAnalysis(rec, lineItems);
+
+  const fmt  = n => '$' + Math.round(Math.abs(n)).toLocaleString('en-US');
+  const sign = variance >= 0 ? '+' : '-';
+  const lineBlock = lineItems.length
+    ? '\nClient breakdown:\n' + lineItems.slice(0, 10).map(li => `  ${li.client}: ${fmt(li.amount)}`).join('\n')
+    : '';
 
   try {
     const response = await anthropic.messages.create({
       model: 'claude-opus-4-8',
-      max_tokens: 400,
+      max_tokens: 150,
       messages: [{
         role: 'user',
-        content: `You are a senior management consultant reconciling a month-end close at a professional services firm. Compare the firm-wide P&L revenue against the sum of client/project revenue for the same month, then write exactly 2 sentences.
+        content: `Month-end P&L reconciliation — ${month}
+P&L revenue: ${fmt(pl_revenue)}
+Projects total: ${fmt(projects_total)}
+Variance: ${sign}${fmt(variance)} (${pct.toFixed(1)}%)${lineBlock}
 
-Month: ${month}
-P&L revenue (actual): $${Math.round(pl_revenue).toLocaleString('en-US')}
-Sum of project revenue: $${Math.round(projects_total).toLocaleString('en-US')}
-Variance: ${variance >= 0 ? '+' : ''}$${Math.round(variance).toLocaleString('en-US')} (${pct.toFixed(1)}%)
-
-Sentence 1: State whether the two sources reconcile and the most likely cause of any gap (e.g. unbilled work, timing, revenue not yet allocated to projects, intercompany items).
-Sentence 2: State the specific action the client's financial analyst should verify before sign-off.
-
-Output only the 2 sentences, no labels.`,
+Write 1–2 short sentences. Name the specific client(s) most likely driving the variance, drilled to the exact line item if possible. Also, identify what the analyst should verify. Keep it concise..`,
       }],
     });
-    return response.content.find(b => b.type === 'text')?.text?.trim() || fallbackAnalysis(rec);
+    return response.content.find(b => b.type === 'text')?.text?.trim() || fallbackAnalysis(rec, lineItems);
   } catch (err) {
     console.error('Claude analysis error:', err);
-    return fallbackAnalysis(rec);
+    return fallbackAnalysis(rec, lineItems);
   }
 }
 
-function fallbackAnalysis(rec) {
+function fallbackAnalysis(rec, lineItems = []) {
   const { month, variance, pct } = rec;
   const abs = '$' + Math.abs(Math.round(variance)).toLocaleString('en-US');
   if (Math.abs(pct) < THRESHOLD) {
-    return `${month} project revenue ties to the P&L within ${Math.abs(pct).toFixed(1)}% (${abs}); no material discrepancy. Confirm the immaterial residual is rounding before sign-off.`;
+    return `${month} ties out within ${Math.abs(pct).toFixed(1)}% (${abs}); confirm residual is rounding.`;
   }
-  const dir = variance > 0 ? 'exceeds' : 'falls short of';
-  return `${month} project revenue ${dir} the P&L by ${abs} (${pct.toFixed(1)}%), suggesting timing differences or work billed but not yet allocated to projects. The analyst should reconcile unbilled/deferred revenue and confirm all client invoices are captured before approving.`;
+  const dir = variance > 0 ? 'exceeds P&L by' : 'falls short of P&L by';
+  const top = lineItems[0] ? ` Largest contributor: ${lineItems[0].client}.` : '';
+  return `${month} project revenue ${dir} ${abs} (${pct.toFixed(1)}%) — verify timing and unbilled work.${top}`;
 }
 
 export { THRESHOLD };

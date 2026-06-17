@@ -226,9 +226,8 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
 .role-step-name { font-size: 0.9rem; font-weight: 700; }
 .role-step-desc { font-size: 0.74rem; color: var(--gray4); line-height: 1.4; margin-top: 0.15rem; }
 .role-subtasks { list-style: none; margin: 0.6rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
-.role-subtasks li { font-size: 0.76rem; color: var(--gray6); line-height: 1.4; }
-.role-subtasks li label { display: flex; align-items: flex-start; gap: 0.45rem; cursor: pointer; }
-.role-subtasks li label input[type="checkbox"] { margin-top: 0.2rem; accent-color: var(--green); flex-shrink: 0; cursor: pointer; }
+.role-subtasks li { font-size: 0.76rem; color: var(--gray6); padding-left: 1.1rem; position: relative; line-height: 1.4; }
+.role-subtasks li::before { content: ''; position: absolute; left: 0; top: 0.42rem; width: 6px; height: 6px; border-radius: 50%; background: var(--beige); }
 
 /* landing calendar card */
 .landing-cal-card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 1.25rem 1.25rem 1rem; }

@@ -31,22 +31,26 @@ Deno.serve(async (req: Request) => {
     return json({ analysis: null, error: "bad_request" }, 400);
   }
 
-  const { month, pl_revenue = 0, projects_total = 0, variance = 0, pct = 0 } = rec as {
+  const {
+    month, pl_revenue = 0, projects_total = 0, variance = 0, pct = 0,
+    lineItems = [],
+  } = rec as {
     month: string; pl_revenue: number; projects_total: number; variance: number; pct: number;
+    lineItems: { client: string; amount: number }[];
   };
 
-  const money = (n: number) => `$${Math.round(n).toLocaleString("en-US")}`;
-  const prompt = `You are a senior management consultant reconciling a month-end close at a professional services firm. Compare the firm-wide P&L revenue against the sum of client/project revenue for the same month, then write exactly 2 sentences.
+  const fmt  = (n: number) => `$${Math.round(Math.abs(n)).toLocaleString("en-US")}`;
+  const sign = variance >= 0 ? "+" : "-";
+  const lineBlock = lineItems.length
+    ? "\nClient breakdown:\n" + lineItems.slice(0, 10).map(li => `  ${li.client}: ${fmt(li.amount)}`).join("\n")
+    : "";
 
-Month: ${month}
-P&L revenue (actual): ${money(pl_revenue)}
-Sum of project revenue: ${money(projects_total)}
-Variance: ${variance >= 0 ? "+" : ""}${money(variance)} (${Number(pct).toFixed(1)}%)
+  const prompt = `Month-end P&L reconciliation — ${month}
+P&L revenue: ${fmt(pl_revenue)}
+Projects total: ${fmt(projects_total)}
+Variance: ${sign}${fmt(variance)} (${Number(pct).toFixed(1)}%)${lineBlock}
 
-Sentence 1: State whether the two sources reconcile and the most likely cause of any gap (e.g. unbilled work, timing, revenue not yet allocated to projects, intercompany items).
-Sentence 2: State the specific action the client's financial analyst should verify before sign-off.
-
-Output only the 2 sentences, no labels.`;
+Write 1–2 short sentences. Name the specific client(s) most likely driving the variance (if line items are provided) and what the analyst should verify. No preamble.`;
 
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -58,7 +62,7 @@ Output only the 2 sentences, no labels.`;
       },
       body: JSON.stringify({
         model: "claude-opus-4-8",
-        max_tokens: 400,
+        max_tokens: 150,
         messages: [{ role: "user", content: prompt }],
       }),
     });
