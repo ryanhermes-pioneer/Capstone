@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-  root: 'Close Tracker',
+  root: 'app',
   envDir: process.cwd(),
 });
