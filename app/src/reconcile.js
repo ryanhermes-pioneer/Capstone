@@ -104,6 +104,24 @@ export function extractProjectLineItems(rows, month) {
     .sort((a, b) => b.amount - a.amount);
 }
 
+// ── Projects → all unique (client, month) pairs ─────────────────
+export function extractAllClientMonths(rows) {
+  if (rows.length < 2) return [];
+  const headers   = rows[0];
+  const monthCol  = Math.max(0, findCol(headers, 'month', 'period'));
+  const clientCol = Math.max(0, findCol(headers, 'client', 'company', 'customer'));
+  const seen = new Set();
+  const out  = [];
+  for (const r of rows.slice(1)) {
+    const client = String(r[clientCol]).trim();
+    const m      = monthName(r[monthCol]);
+    if (!client || !MONTH_ORDER.includes(m)) continue;
+    const key = `${client}|${m}`;
+    if (!seen.has(key)) { seen.add(key); out.push({ client, month: m }); }
+  }
+  return out;
+}
+
 // ── Build reconciliation records ────────────────────────────────
 export function buildReconciliations(plRevenue, projectTotals) {
   const months = [...new Set([...Object.keys(plRevenue), ...Object.keys(projectTotals)])]

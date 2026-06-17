@@ -228,6 +228,8 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
 .role-subtasks { list-style: none; margin: 0.6rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
 .role-subtasks li { font-size: 0.76rem; color: var(--gray6); padding-left: 1.1rem; position: relative; line-height: 1.4; }
 .role-subtasks li::before { content: ''; position: absolute; left: 0; top: 0.42rem; width: 6px; height: 6px; border-radius: 50%; background: var(--beige); }
+.role-subtasks li.sub-done { color: var(--gray4); }
+.role-subtasks li.sub-done::before { background: var(--green); }
 
 /* landing calendar card */
 .landing-cal-card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 1.25rem 1.25rem 1rem; }
@@ -360,9 +362,3 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
 .cal-chip.pri-high { background: #fde8e7; color: var(--red); }
 .cal-chip.pri-med  { background: #fef3e2; color: var(--amber); }
 .cal-chip.pri-low  { background: #e8f4ee; color: #2e7d52; }
-
-/* ── Priority badge ── */
-.pri-badge { font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.15rem 0.5rem; border-radius: 4px; }
-.pri-badge.pri-high { background: #fde8e7; color: var(--red); }
-.pri-badge.pri-med  { background: #fef3e2; color: var(--amber); }
-.pri-badge.pri-low  { background: #e8f4ee; color: #2e7d52; }

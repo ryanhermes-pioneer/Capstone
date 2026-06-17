@@ -4,7 +4,7 @@ import {
   MONTH_ORDER, THRESHOLD,
   fileToRows,
   extractPLRevenue, extractProjectTotals, buildReconciliations, analyzeReconciliation,
-  extractProjectLineItems,
+  extractProjectLineItems, extractAllClientMonths,
   extractCompanies, extractMonthsForCompany, extractProjectsForCompany,
 } from './src/reconcile.js';
 
@@ -183,7 +183,7 @@ function staticCalendarHTML(now) {
       { title: 'Reconcile Accts',  priority: 'med' },
       { title: 'Review Variances', priority: 'med' },
     ],
-    [daysInMonth - 3]: [
+    [daysInMonth - 4]: [
       { title: 'Draft P&L',        priority: 'low' },
     ],
   };
@@ -205,59 +205,80 @@ function staticCalendarHTML(now) {
   return html;
 }
 
-function renderLanding() {
+async function renderLanding() {
   const now = new Date();
   const monthName = MONTH_ORDER[now.getMonth()];
   const year = now.getFullYear();
+
+  // Fetch reconciliation + invoice state — anon RLS allows select on both
+  let recs = [], inv = [];
+  try {
+    const [recRes, invRes] = await Promise.all([
+      supabase.from('reconciliations').select('status, claude_analysis'),
+      supabase.from('invoice_status').select('sent').eq('month', monthName).eq('year', year),
+    ]);
+    recs = recRes.data ?? [];
+    inv  = invRes.data ?? [];
+  } catch (_) {}
+
+  // Director subtask completion (tracked via invoice_status)
+  const dSub = [
+    inv.length > 0,                              // file uploaded → clients seeded
+    inv.some(r => r.sent),                       // at least one invoice sent
+    inv.length > 0 && inv.every(r => r.sent),    // all clients invoiced
+  ];
+
+  // Analyst subtask completion
+  const aSub = [
+    recs.length > 0,
+    recs.some(r => r.claude_analysis),
+    recs.length > 0 && recs.every(r => r.status !== 'pending_analyst'),
+  ];
+
+  // CFO subtask completion
+  const cSub = [
+    recs.some(r => ['pending_cfo', 'approved', 'denied'].includes(r.status)),
+    recs.some(r => ['approved', 'denied'].includes(r.status)),
+    recs.length > 0 && recs.every(r => r.status === 'approved'),
+  ];
+
+  const sub = (labels, done) => labels.map((t, i) =>
+    `<li class="${done[i] ? 'sub-done' : ''}">${t}</li>`).join('');
 
   view.innerHTML = `
     <div class="landing-split">
 
       <div class="landing-left">
-        <div class="landing-brand">
-          <img class="p-badge-lg" src="/logo_green.png" alt="Pioneer">
-          <div>
-            <h1 class="landing-title">Claude <em>Close</em></h1>
-            <p class="landing-sub">EPiC ${year} &middot; Pioneer Management Consulting</p>
-          </div>
-        </div>
-
         <div class="role-track">
           <div class="role-step">
-            <div class="role-step-icon" id="stepIcon1">1</div>
+            <div class="role-step-icon${dSub.every(Boolean) ? ' complete' : ''}">1</div>
             <div class="role-step-body">
               <div class="role-step-name">Director</div>
               <div class="role-step-desc">Generate &amp; distribute client invoices</div>
               <ul class="role-subtasks">
-                <li>Upload project revenue data</li>
-                <li>Generate per-client invoices</li>
-                <li>Send monthly statements</li>
+                ${sub(['Upload project revenue data', 'Generate per-client invoices', 'Send monthly statements'], dSub)}
               </ul>
             </div>
           </div>
           <div class="role-connector"></div>
           <div class="role-step">
-            <div class="role-step-icon" id="stepIcon2">2</div>
+            <div class="role-step-icon${aSub.every(Boolean) ? ' complete' : ''}">2</div>
             <div class="role-step-body">
               <div class="role-step-name">Analyst</div>
               <div class="role-step-desc">Reconcile P&amp;L against projects &amp; run Claude analysis</div>
               <ul class="role-subtasks">
-                <li>Upload P&amp;L &amp; projects CSVs</li>
-                <li>Review Claude variance analysis</li>
-                <li>Submit months for CFO review</li>
+                ${sub(['Upload P&amp;L &amp; projects CSVs', 'Review Claude variance analysis', 'Submit months for CFO review'], aSub)}
               </ul>
             </div>
           </div>
           <div class="role-connector"></div>
           <div class="role-step">
-            <div class="role-step-icon" id="stepIcon3">3</div>
+            <div class="role-step-icon${cSub.every(Boolean) ? ' complete' : ''}">3</div>
             <div class="role-step-body">
               <div class="role-step-name">CFO</div>
               <div class="role-step-desc">Review variances, approve or deny months</div>
               <ul class="role-subtasks">
-                <li>Review pending reconciliations</li>
-                <li>Approve or deny with notes</li>
-                <li>Download approved month report</li>
+                ${sub(['Review pending reconciliations', 'Approve or deny with notes', 'Download approved month report'], cSub)}
               </ul>
             </div>
           </div>
@@ -420,7 +441,6 @@ function sidebarHTML() {
   const items = _sidebarTasks.length
     ? _sidebarTasks.map(t => {
         const done   = t.status === 'complete';
-        const priCls = { high: 'pri-high', low: 'pri-low', medium: 'pri-med' }[t.priority] ?? 'pri-med';
         const dueFmt = t.due_date
           ? new Date(t.due_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
           : '';
@@ -431,7 +451,6 @@ function sidebarHTML() {
               <span class="task-title">${esc(t.title)}</span>
               ${dueFmt ? `<span class="task-due">${dueFmt}</span>` : ''}
             </div>
-            <span class="pri-badge ${priCls}">${(t.priority ?? 'M')[0].toUpperCase()}</span>
           </div>`;
       }).join('')
     : '<p class="sidebar-empty">No tasks assigned</p>';
@@ -517,6 +536,43 @@ async function loadConsultantFile(file) {
   try { consultant.projRows = await fileToRows(file); }
   catch (err) { toast(`Could not read ${file.name}: ${err.message}`, 'err'); return; }
   consultant.selectedCompany = null; consultant.selectedMonth = null;
+
+  // Seed invoice_status with every client-month from the file (ignoreDuplicates
+  // preserves any already-sent rows)
+  const pairs = extractAllClientMonths(consultant.projRows);
+  if (pairs.length) {
+    // Seed invoice_status (preserves already-sent rows)
+    await supabase.from('invoice_status')
+      .upsert(pairs.map(({ client, month }) => ({ client, month, year: 2026 })),
+              { onConflict: 'client,month,year', ignoreDuplicates: true });
+
+    // Seed close_tasks — one "Invoice: {client}" task per client/month, skip existing
+    const months = [...new Set(pairs.map(p => p.month))];
+    const { data: existing } = await supabase
+      .from('close_tasks')
+      .select('title, period_month')
+      .eq('owner_email', currentUser?.email ?? null)
+      .eq('period_year', 2026)
+      .in('period_month', months)
+      .like('title', 'Invoice:%');
+
+    const existingKeys = new Set((existing ?? []).map(t => `${t.title}|${t.period_month}`));
+    const newTasks = pairs
+      .filter(({ client, month }) => !existingKeys.has(`Invoice: ${client}|${month}`))
+      .map(({ client, month }) => ({
+        title:        `Invoice: ${client}`,
+        owner_email:  currentUser?.email ?? null,
+        due_date:     new Date(2026, MONTH_ORDER.indexOf(month) + 1, 0).toISOString().slice(0, 10),
+        priority:     'high',
+        status:       'not_started',
+        period_month: month,
+        period_year:  2026,
+      }));
+
+    if (newTasks.length) await supabase.from('close_tasks').insert(newTasks);
+    _sidebarTasks = await loadSidebarTasks();
+  }
+
   renderConsultant();
 }
 
@@ -597,9 +653,22 @@ function renderInvoiceCard() {
     downloadInvoicePDF(co, mo, projects);
   });
 
-  document.getElementById('btnSendInvoice').addEventListener('click', () => {
+  document.getElementById('btnSendInvoice').addEventListener('click', async () => {
     downloadInvoicePDF(co, mo, projects);
+    await Promise.all([
+      supabase.from('invoice_status')
+        .update({ sent: true, sent_at: new Date().toISOString(), sent_by: currentUser?.email ?? null })
+        .eq('client', co).eq('month', mo).eq('year', 2026),
+      supabase.from('close_tasks')
+        .update({ status: 'complete' })
+        .eq('title', `Invoice: ${co}`)
+        .eq('period_month', mo)
+        .eq('period_year', 2026)
+        .eq('owner_email', currentUser?.email ?? null),
+    ]);
+    _sidebarTasks = await loadSidebarTasks();
     toast(`Invoice downloaded — open Outlook, compose, and attach the PDF from your downloads`);
+    renderConsultant();
   });
 }
 
