@@ -18,6 +18,8 @@ const QUARTERS = {
 // ── State ────────────────────────────────────────────────────────
 let currentUser = null;
 let currentRole = null;
+let _sidebarTasks = [];
+
 const consultant = { projRows: null, selectedCompany: null, selectedMonth: null };
 const analyst    = {
   plRows: null, projRows: null,
@@ -88,7 +90,7 @@ async function init() {
     if (event === 'SIGNED_IN' && session) await onSignIn(session.user);
     else if (event === 'SIGNED_OUT') {
       if (realtimeChannel) { supabase.removeChannel(realtimeChannel); realtimeChannel = null; }
-      currentUser = null; currentRole = null;
+      currentUser = null; currentRole = null; _sidebarTasks = [];
       setHeader(false); renderLanding();
     }
   });
@@ -142,7 +144,8 @@ function updateProgress(recs) {
 
 document.getElementById('homeBadge').addEventListener('click',  async () => supabase.auth.signOut());
 document.getElementById('btnSignOut').addEventListener('click', async () => supabase.auth.signOut());
-function renderForRole() {
+async function renderForRole() {
+  _sidebarTasks = await loadSidebarTasks();
   if (currentRole === 'director') return renderConsultant();
   if (currentRole === 'analyst')  return renderAnalyst();
   if (currentRole === 'cfo')      return renderCFO();
@@ -152,31 +155,159 @@ function renderForRole() {
 // LANDING — Login
 // ══════════════════════════════════════════════════════════════════
 
+function workingDaysLeft() {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const last = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+  let count = 0;
+  for (let d = new Date(today); d <= last; d.setDate(d.getDate() + 1)) {
+    const dow = d.getDay();
+    if (dow !== 0 && dow !== 6) count++;
+  }
+  return count;
+}
+
+function staticCalendarHTML(now) {
+  const year = now.getFullYear(), month = now.getMonth();
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const dayNames = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+
+  const eomTasks = {
+    [daysInMonth]: [
+      { title: 'Send Invoices',    priority: 'high' },
+      { title: 'Submit P&L Rec',   priority: 'high' },
+      { title: 'CFO Sign-off',     priority: 'high' },
+    ],
+    [daysInMonth - 1]: [
+      { title: 'Reconcile Accts',  priority: 'med' },
+      { title: 'Review Variances', priority: 'med' },
+    ],
+    [daysInMonth - 3]: [
+      { title: 'Draft P&L',        priority: 'low' },
+    ],
+  };
+
+  let html = `<table class="cal-grid"><thead><tr>${dayNames.map(d => `<th>${d}</th>`).join('')}</tr></thead><tbody><tr>`;
+  let col = 0;
+  for (let i = 0; i < firstDay; i++) { html += '<td></td>'; col++; }
+  for (let d = 1; d <= daysInMonth; d++) {
+    const isToday = d === now.getDate();
+    const chips = (eomTasks[d] || []).map(t =>
+      `<div class="cal-chip pri-${t.priority === 'med' ? 'med' : t.priority}" title="${t.title}">${t.title}</div>`
+    ).join('');
+    html += `<td class="${isToday ? 'cal-today' : ''}"><span class="cal-day-num${isToday ? ' today-num' : ''}">${d}</span>${chips}</td>`;
+    col++;
+    if (col % 7 === 0 && d < daysInMonth) html += '</tr><tr>';
+  }
+  while (col % 7 !== 0) { html += '<td></td>'; col++; }
+  html += '</tr></tbody></table>';
+  return html;
+}
+
 function renderLanding() {
+  const now = new Date();
+  const monthName = MONTH_ORDER[now.getMonth()];
+  const year = now.getFullYear();
+
   view.innerHTML = `
-    <div class="landing">
-      <div class="landing-card">
-        <div class="landing-logo">
+    <div class="landing-split">
+
+      <div class="landing-left">
+        <div class="landing-brand">
           <img class="p-badge-lg" src="/logo_green.png" alt="Pioneer">
-          <h1 class="landing-title">Claude <em>Close</em></h1>
-          <p class="landing-sub">EPiC 2026 &middot; Pioneer Management Consulting</p>
+          <div>
+            <h1 class="landing-title">Claude <em>Close</em></h1>
+            <p class="landing-sub">EPiC ${year} &middot; Pioneer Management Consulting</p>
+          </div>
         </div>
-        <form class="login-form" id="loginForm" novalidate>
-          <div class="field-group">
-            <label class="field-lbl" for="loginEmail">Email</label>
-            <input class="field-input" type="email" id="loginEmail"
-              placeholder="you@thepioneerteam.com" required autocomplete="email">
+
+        <div class="role-track">
+          <div class="role-step">
+            <div class="role-step-icon" id="stepIcon1">1</div>
+            <div class="role-step-body">
+              <div class="role-step-name">Director</div>
+              <div class="role-step-desc">Generate &amp; distribute client invoices</div>
+              <ul class="role-subtasks">
+                <li><label><input type="checkbox" data-step="1"> Upload project revenue data</label></li>
+                <li><label><input type="checkbox" data-step="1"> Generate per-client invoices</label></li>
+                <li><label><input type="checkbox" data-step="1"> Send monthly statements</label></li>
+              </ul>
+            </div>
           </div>
-          <div class="field-group">
-            <label class="field-lbl" for="loginPw">Password</label>
-            <input class="field-input" type="password" id="loginPw"
-              placeholder="••••••••" required autocomplete="current-password">
+          <div class="role-connector"></div>
+          <div class="role-step">
+            <div class="role-step-icon" id="stepIcon2">2</div>
+            <div class="role-step-body">
+              <div class="role-step-name">Analyst</div>
+              <div class="role-step-desc">Reconcile P&amp;L against projects &amp; run Claude analysis</div>
+              <ul class="role-subtasks">
+                <li><label><input type="checkbox" data-step="2"> Upload P&amp;L &amp; projects CSVs</label></li>
+                <li><label><input type="checkbox" data-step="2"> Review Claude variance analysis</label></li>
+                <li><label><input type="checkbox" data-step="2"> Submit months for CFO review</label></li>
+              </ul>
+            </div>
           </div>
-          <p class="login-err" id="loginErr"></p>
-          <button class="btn btn-primary btn-full" type="submit" id="btnLogin">Sign in</button>
-        </form>
+          <div class="role-connector"></div>
+          <div class="role-step">
+            <div class="role-step-icon" id="stepIcon3">3</div>
+            <div class="role-step-body">
+              <div class="role-step-name">CFO</div>
+              <div class="role-step-desc">Review variances, approve or deny months</div>
+              <ul class="role-subtasks">
+                <li><label><input type="checkbox" data-step="3"> Review pending reconciliations</label></li>
+                <li><label><input type="checkbox" data-step="3"> Approve or deny with notes</label></li>
+                <li><label><input type="checkbox" data-step="3"> Download approved month report</label></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="landing-cal-card">
+          <div class="cal-meta">
+            <span class="cal-month">${monthName} ${year}</span>
+            <span class="days-to-close">${workingDaysLeft()} working days to close</span>
+          </div>
+          ${staticCalendarHTML(now)}
+        </div>
       </div>
+
+      <div class="landing-right">
+        <div class="landing-card">
+          <div class="landing-logo">
+            <img class="p-badge-lg" src="/logo_green.png" alt="Pioneer">
+            <h1 class="landing-title">Sign in</h1>
+            <p class="landing-sub">Access your close dashboard</p>
+          </div>
+          <form class="login-form" id="loginForm" novalidate>
+            <div class="field-group">
+              <label class="field-lbl" for="loginEmail">Email</label>
+              <input class="field-input" type="email" id="loginEmail"
+                placeholder="you@thepioneerteam.com" required autocomplete="email">
+            </div>
+            <div class="field-group">
+              <label class="field-lbl" for="loginPw">Password</label>
+              <input class="field-input" type="password" id="loginPw"
+                placeholder="••••••••" required autocomplete="current-password">
+            </div>
+            <p class="login-err" id="loginErr"></p>
+            <button class="btn btn-primary btn-full" type="submit" id="btnLogin">Sign in</button>
+          </form>
+        </div>
+      </div>
+
     </div>`;
+
+  function syncStepIcons() {
+    [1, 2, 3].forEach(n => {
+      const boxes = view.querySelectorAll(`input[data-step="${n}"]`);
+      const icon  = view.querySelector(`#stepIcon${n}`);
+      if (!icon || !boxes.length) return;
+      icon.classList.toggle('complete', Array.from(boxes).every(b => b.checked));
+    });
+  }
+  view.querySelectorAll('.role-subtasks input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener('change', syncStepIcons);
+  });
 
   document.getElementById('loginForm').addEventListener('submit', async e => {
     e.preventDefault();
@@ -281,25 +412,103 @@ function downloadCSV(recs, filename) {
 // DIRECTOR — Invoice generator
 // ══════════════════════════════════════════════════════════════════
 
+// ── Sidebar helpers ──────────────────────────────────────────────
+async function loadSidebarTasks() {
+  if (!currentUser) return [];
+  const { data, error } = await supabase
+    .from('close_tasks')
+    .select('*')
+    .eq('owner_email', currentUser.email)
+    .order('due_date', { ascending: true, nullsLast: true });
+  if (error) { console.error('close_tasks:', error.message); return []; }
+  return data ?? [];
+}
+
+function sidebarHTML() {
+  const now = new Date();
+  const monthName = MONTH_ORDER[now.getMonth()];
+  const year = now.getFullYear();
+  const items = _sidebarTasks.length
+    ? _sidebarTasks.map(t => {
+        const done   = t.status === 'complete';
+        const priCls = { high: 'pri-high', low: 'pri-low', medium: 'pri-med' }[t.priority] ?? 'pri-med';
+        const dueFmt = t.due_date
+          ? new Date(t.due_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+          : '';
+        return `
+          <div class="sidebar-task${done ? ' done' : ''}" data-task-id="${t.id}" data-done="${done}">
+            <button class="task-check">${done ? '✓' : ''}</button>
+            <div class="task-body">
+              <span class="task-title">${esc(t.title)}</span>
+              ${dueFmt ? `<span class="task-due">${dueFmt}</span>` : ''}
+            </div>
+            <span class="pri-badge ${priCls}">${(t.priority ?? 'M')[0].toUpperCase()}</span>
+          </div>`;
+      }).join('')
+    : '<p class="sidebar-empty">No tasks assigned</p>';
+  return `
+    <div class="sidebar-section">
+      <div class="sidebar-cal-wrap">
+        <div class="cal-meta">
+          <span class="cal-month">${monthName} ${year}</span>
+          <span class="days-to-close">${workingDaysLeft()} days</span>
+        </div>
+        ${staticCalendarHTML(now)}
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-hdr">My Tasks</div>
+      <div class="sidebar-tasks">${items}</div>
+    </div>`;
+}
+
+function wireSidebar() {
+  view.querySelectorAll('.sidebar-task .task-check').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const row    = btn.closest('.sidebar-task');
+      const id     = row.dataset.taskId;
+      const isDone = row.dataset.done === 'true';
+      const { error } = await supabase
+        .from('close_tasks')
+        .update({ status: isDone ? 'not_started' : 'complete', updated_at: new Date().toISOString() })
+        .eq('id', id);
+      if (!error) {
+        const nowDone = !isDone;
+        row.dataset.done = String(nowDone);
+        row.classList.toggle('done', nowDone);
+        btn.textContent = nowDone ? '✓' : '';
+        const cached = _sidebarTasks.find(t => t.id === id);
+        if (cached) cached.status = nowDone ? 'complete' : 'not_started';
+      }
+    });
+  });
+}
+
 async function renderConsultant() {
   view.innerHTML = `
-    <section class="card">
-      <h1>Generate invoice</h1>
-      <p class="sub">Upload the projects file, then select a client and billing month to preview and send the invoice.</p>
-      <div class="source-row">
-        <label class="drop ${consultant.projRows ? 'loaded' : ''}" id="drop-cproj">
-          <input type="file" id="file-cproj" accept=".csv,.xlsx,.xls" hidden>
-          <div class="drop-icon">${consultant.projRows ? '✓' : '📄'}</div>
-          <strong>Projects / Revenue file</strong>
-          <span>${consultant.projRows ? 'Loaded — click to replace' : 'Click or drop CSV / XLSX'}</span>
-        </label>
-        <button class="btn fabric-btn" id="btnFabric">
-          <span class="fabric-icon">⬡</span> Load from Fabric
-        </button>
+    <div class="role-layout">
+      <div class="role-sidebar">${sidebarHTML()}</div>
+      <div class="role-content">
+        <section class="card">
+          <h1>Generate invoice</h1>
+          <p class="sub">Upload the projects file, then select a client and billing month to preview and send the invoice.</p>
+          <div class="source-row">
+            <label class="drop ${consultant.projRows ? 'loaded' : ''}" id="drop-cproj">
+              <input type="file" id="file-cproj" accept=".csv,.xlsx,.xls" hidden>
+              <div class="drop-icon">${consultant.projRows ? '✓' : '📄'}</div>
+              <strong>Projects / Revenue file</strong>
+              <span>${consultant.projRows ? 'Loaded — click to replace' : 'Click or drop CSV / XLSX'}</span>
+            </label>
+            <button class="btn fabric-btn" id="btnFabric">
+              <span class="fabric-icon">⬡</span> Load from Fabric
+            </button>
+          </div>
+          <div id="invoiceWrap"></div>
+        </section>
       </div>
-      <div id="invoiceWrap"></div>
-    </section>`;
+    </div>`;
 
+  wireSidebar();
   const drop  = document.getElementById('drop-cproj');
   const input = document.getElementById('file-cproj');
   input.addEventListener('change', e => e.target.files[0] && loadConsultantFile(e.target.files[0]));
@@ -464,15 +673,22 @@ async function renderAnalyst() {
   }
 
   view.innerHTML = `
-    <section class="card">
-      <h1>P&L reconciliation</h1>
-      <p class="sub">Select a reporting period to verify whether the P&L revenue matches the sum of client project revenues.</p>
-      <div class="drops">
-        ${dropHTML('pl',   'P&L (financial actuals)', analyst.plRows)}
-        ${dropHTML('proj', 'Projects by company',     analyst.projRows)}
+    <div class="role-layout">
+      <div class="role-sidebar">${sidebarHTML()}</div>
+      <div class="role-content">
+        <section class="card">
+          <h1>P&L reconciliation</h1>
+          <p class="sub">Select a reporting period to verify whether the P&L revenue matches the sum of client project revenues.</p>
+          <div class="drops">
+            ${dropHTML('pl',   'P&L (financial actuals)', analyst.plRows)}
+            ${dropHTML('proj', 'Projects by company',     analyst.projRows)}
+          </div>
+          ${periodHTML}
+        </section>
       </div>
-      ${periodHTML}
-    </section>`;
+    </div>`;
+
+  wireSidebar();
 
   wireAnalystDrop('pl',   'plRows');
   wireAnalystDrop('proj', 'projRows');
@@ -650,31 +866,37 @@ async function renderCFO() {
   const logRows = auditLogRows(log);
 
   view.innerHTML = `
-    <section class="card">
-      <h1>CFO sign-off</h1>
-      <p class="sub">Review pending reconciliations. Deny individual months or approve all at once.</p>
-      ${pendingRecs.length ? cfoTable(pendingRecs) : '<p class="hint">No months pending review.</p>'}
-      <div class="actions-row" style="gap:0.75rem;">
-        ${pendingRecs.length ? `
-          <button class="btn btn-primary" id="btnApproveAll">
-            Approve all (${pendingRecs.length} month${pendingRecs.length!==1?'s':''})
-          </button>` : ''}
-        ${approvedRecs.length ? `
-          <button class="btn" id="btnDownload">
-            Download approved (${approvedRecs.length} month${approvedRecs.length!==1?'s':''})
-          </button>` : ''}
+    <div class="role-layout">
+      <div class="role-sidebar">${sidebarHTML()}</div>
+      <div class="role-content">
+        <section class="card">
+          <h1>CFO sign-off</h1>
+          <p class="sub">Review pending reconciliations. Deny individual months or approve all at once.</p>
+          ${pendingRecs.length ? cfoTable(pendingRecs) : '<p class="hint">No months pending review.</p>'}
+          <div class="actions-row" style="gap:0.75rem;">
+            ${pendingRecs.length ? `
+              <button class="btn btn-primary" id="btnApproveAll">
+                Approve all (${pendingRecs.length} month${pendingRecs.length!==1?'s':''})
+              </button>` : ''}
+            ${approvedRecs.length ? `
+              <button class="btn" id="btnDownload">
+                Download approved (${approvedRecs.length} month${approvedRecs.length!==1?'s':''})
+              </button>` : ''}
+          </div>
+        </section>
+        <section class="card audit-card">
+          <h2 class="audit-hdr">Audit trail</h2>
+          <div class="tscroll">
+            <table class="ledger">
+              <thead><tr><th>Time</th><th>Action</th><th>Month</th><th>By</th><th>Notes</th></tr></thead>
+              <tbody>${logRows}</tbody>
+            </table>
+          </div>
+        </section>
       </div>
-    </section>
-    <section class="card audit-card">
-      <h2 class="audit-hdr">Audit trail</h2>
-      <div class="tscroll">
-        <table class="ledger">
-          <thead><tr><th>Time</th><th>Action</th><th>Month</th><th>By</th><th>Notes</th></tr></thead>
-          <tbody>${logRows}</tbody>
-        </table>
-      </div>
-    </section>`;
+    </div>`;
 
+  wireSidebar();
   wireCFOActions(pendingRecs, approvedRecs);
 }
 
