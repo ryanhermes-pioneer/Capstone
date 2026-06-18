@@ -144,6 +144,7 @@ function updateProgress(recs) {
 }
 
 document.getElementById('homeBadge').addEventListener('click',  async () => supabase.auth.signOut());
+document.getElementById('brandName').addEventListener('click',  async () => supabase.auth.signOut());
 document.getElementById('btnSignOut').addEventListener('click', async () => supabase.auth.signOut());
 async function renderForRole() {
   _sidebarTasks = await loadSidebarTasks();
