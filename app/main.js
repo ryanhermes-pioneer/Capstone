@@ -403,12 +403,28 @@ async function updateAuditTrail() {
 
 // ── CSV download ─────────────────────────────────────────────────
 function downloadCSV(recs, filename) {
-  const headers = ['Month','Year','P&L Revenue','Projects Total','Variance','% Variance','Status'];
+  const headers = [
+    'Record ID','Month','Year',
+    'P&L Revenue','Projects Total','Variance ($)','Variance (%)','Material',
+    'Status',
+    'Analyst Confirmed At (UTC)','CFO Decided At (UTC)',
+    'Denial Note','Claude AI Analysis',
+  ];
   const rows = recs.map(r => {
-    const v = r.projects_total - r.pl_revenue;
+    const v   = r.projects_total - r.pl_revenue;
     const pct = r.pl_revenue ? (v / Math.abs(r.pl_revenue)) * 100 : 0;
-    return [r.month, r.year || 2026, r.pl_revenue, r.projects_total, v, pct.toFixed(1) + '%', r.status]
-      .map(val => `"${String(val).replace(/"/g,'""')}"`).join(',');
+    const mat = Math.abs(pct) >= THRESHOLD ? 'Yes' : 'No';
+    return [
+      r.id || '',
+      r.month, r.year || 2026,
+      r.pl_revenue, r.projects_total,
+      v.toFixed(2), pct.toFixed(2) + '%', mat,
+      r.status,
+      r.analyst_confirmed_at ? new Date(r.analyst_confirmed_at).toISOString() : '',
+      r.cfo_decided_at       ? new Date(r.cfo_decided_at).toISOString()       : '',
+      r.denial_note          || '',
+      r.claude_analysis      || '',
+    ].map(val => `"${String(val).replace(/"/g,'""')}"`).join(',');
   });
   const csv  = [headers.join(','), ...rows].join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -998,11 +1014,19 @@ function wireCFOActions(pendingRecs, approvedRecs, log = []) {
   });
 
   document.getElementById('btnDownloadAudit')?.addEventListener('click', () => {
-    const headers = ['Time', 'Action', 'Month', 'Year', 'By', 'Notes'];
-    const rows = log.map(e => [
-      new Date(e.created_at).toLocaleString('en-US'),
-      e.action, e.month || '', e.year || '', e.user_email || '', e.details || '',
-    ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
+    const headers = ['Event ID','Timestamp (UTC)','Timestamp (Local)','Action','Month','Year','Performed By','Notes'];
+    const rows = log.map(e => {
+      const d = new Date(e.created_at);
+      return [
+        e.id || '',
+        d.toISOString(),
+        d.toLocaleString('en-US', { timeZoneName: 'short' }),
+        e.action,
+        e.month || '', e.year || '',
+        e.user_email || '',
+        e.details || '',
+      ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
+    });
     const csv  = [headers.join(','), ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url  = URL.createObjectURL(blob);
